@@ -1,34 +1,29 @@
 import { createHealthHandler } from "./handlers/health.handler.js";
 import { createTaskHandler } from "./handlers/task.handler.js";
-import { createTaskRepository } from "./repositories/task.repository.js";
-import { createCloudflareQueueService } from "./services/queue.service.js";
+import { createSupabaseTaskRepository } from "./repositories/task.repository.js";
+import { createAgentService } from "./services/agent.service.js";
 import { createHttpTransport } from "./transports/http.js";
 import { createMcpTransport } from "./transports/mcp.js";
 import { createWorkerTransport } from "./transports/worker.js";
 import { createTaskUsecase } from "./usecases/task.usecase.js";
-import {
-  readCloudflareQueueConfig,
-  readFeatureFlags,
-  readLogConfig,
-  readServerConfig,
-} from "./utilities/env.js";
 import { ConfigError } from "./utilities/errors.js";
 import { createFileLogger } from "./utilities/logger.js";
 import { getPackageInfo } from "./utilities/package-info.js";
+import { loadSettings, validateSettings } from "./utilities/settings.js";
 
 /**
- * Composition root: wires repositories -> services -> usecases -> handlers -> transports.
+ * Composition root: wires settings -> repositories -> services -> usecases -> handlers -> transports.
  */
 export async function startApp({
+  configPath = undefined,
+  settings = undefined,
   host = undefined,
   port = undefined,
   installSignalHandlers = true,
-  env = process.env,
-  queueService = null,
   taskRepository = null,
+  agentService = null,
   executeTask = undefined,
-  workerIntervalMs = 1_000,
-  mockDelayMs = 5_000,
+  workerIntervalMs = undefined,
   logger = undefined,
   enableHttp = undefined,
   enableMcp = undefined,
@@ -37,22 +32,39 @@ export async function startApp({
 } = {}) {
   const appInfo = getPackageInfo();
 
-  const envFlags = readFeatureFlags(env);
-  const resolvedEnableHttp = enableHttp ?? envFlags.enableHttp;
-  const resolvedEnableMcp = enableMcp ?? envFlags.enableMcp;
-  const resolvedEnableWorker = enableWorker ?? startWorker ?? envFlags.enableWorker;
+  let resolvedSettings;
+  let settingsPath = null;
+  let settingsCreated = false;
+
+  if (settings !== undefined) {
+    resolvedSettings = validateSettings(settings, {
+      requireSupabase: !taskRepository,
+    });
+  } else {
+    const loaded = loadSettings({
+      configPath,
+      requireSupabase: !taskRepository,
+    });
+    resolvedSettings = loaded.settings;
+    settingsPath = loaded.path;
+    settingsCreated = loaded.created;
+  }
+
+  const resolvedEnableHttp = enableHttp ?? resolvedSettings.transports.http;
+  const resolvedEnableMcp = enableMcp ?? resolvedSettings.transports.mcp;
+  const resolvedEnableWorker =
+    enableWorker ?? startWorker ?? resolvedSettings.transports.worker;
 
   if (!resolvedEnableHttp && !resolvedEnableMcp && !resolvedEnableWorker) {
     throw new ConfigError(
-      "At least one of ENABLE_HTTP, ENABLE_MCP, or ENABLE_WORKER must be enabled",
+      "At least one of transports.http, transports.mcp, or transports.worker must be enabled",
     );
   }
 
   let resolvedLogger = logger;
   let ownsLogger = false;
-  let logDir = null;
+  const logDir = resolvedSettings.logging.dir;
   if (!resolvedLogger) {
-    ({ dir: logDir } = readLogConfig(env));
     resolvedLogger = createFileLogger({ dir: logDir });
     ownsLogger = true;
   }
@@ -63,15 +75,27 @@ export async function startApp({
     worker: resolvedEnableWorker,
   };
 
-  const resolvedTaskRepository = taskRepository ?? createTaskRepository();
-  const resolvedQueueService =
-    queueService ?? createCloudflareQueueService(readCloudflareQueueConfig(env));
+  const resolvedTaskRepository =
+    taskRepository ??
+    createSupabaseTaskRepository({
+      url: resolvedSettings.supabase.url,
+      publishableKey: resolvedSettings.supabase.publishable_key,
+      schema: resolvedSettings.supabase.schema,
+      table: resolvedSettings.supabase.table,
+    });
+
+  const resolvedAgentService =
+    agentService ??
+    createAgentService({
+      workerConfig: resolvedSettings.worker,
+      logger: resolvedLogger,
+    });
 
   const taskUsecase = createTaskUsecase({
     taskRepository: resolvedTaskRepository,
-    queueService: resolvedQueueService,
+    agentService: resolvedAgentService,
     executeTask,
-    mockDelayMs,
+    workerConfig: resolvedSettings.worker,
     logger: resolvedLogger,
   });
 
@@ -80,7 +104,7 @@ export async function startApp({
 
   const workerTransport = createWorkerTransport({
     taskHandler,
-    intervalMs: workerIntervalMs,
+    intervalMs: workerIntervalMs ?? resolvedSettings.worker.poll_interval_ms,
     logger: resolvedLogger,
   });
   const getWorkerStatus = () => workerTransport.status();
@@ -113,9 +137,8 @@ export async function startApp({
 
   let binding = { host: null, port: null, url: null };
   if (httpTransport) {
-    const serverConfig = readServerConfig(env);
-    const resolvedHost = host ?? serverConfig.host;
-    const resolvedPort = port ?? serverConfig.port;
+    const resolvedHost = host ?? resolvedSettings.server.host;
+    const resolvedPort = port ?? resolvedSettings.server.port;
     try {
       binding = await httpTransport.listen({ host: resolvedHost, port: resolvedPort });
     } catch (error) {
@@ -128,14 +151,23 @@ export async function startApp({
   }
 
   resolvedLogger.log(`${appInfo.name} v${appInfo.version} ready`);
-  resolvedLogger.log(`HTTP:   ${resolvedEnableHttp ? `${binding.url}/tasks` : "disabled"}`);
-  resolvedLogger.log(`MCP:    ${resolvedEnableMcp ? `${binding.url}/mcp` : "disabled"}`);
-  if (binding.url) {
-    resolvedLogger.log(`Health: ${binding.url}/health`);
+  if (settingsPath) {
+    resolvedLogger.log(
+      `Settings: ${settingsPath}${settingsCreated ? " (created default)" : ""}`,
+    );
   }
-  resolvedLogger.log(`Worker: ${resolvedEnableWorker ? "running" : "disabled"}`);
+  resolvedLogger.log(`HTTP:     ${resolvedEnableHttp ? `${binding.url}/tasks` : "disabled"}`);
+  resolvedLogger.log(`MCP:      ${resolvedEnableMcp ? `${binding.url}/mcp` : "disabled"}`);
+  if (binding.url) {
+    resolvedLogger.log(`Health:   ${binding.url}/health`);
+  }
+  resolvedLogger.log(
+    `Worker:   ${resolvedEnableWorker ? `running (id=${resolvedSettings.worker.worker_id})` : "disabled"}`,
+  );
+  resolvedLogger.log(`Agents:   ${resolvedSettings.worker.allowed_agents.join(", ")}`);
+  resolvedLogger.log(`Runs:     ${resolvedSettings.worker.runs_dir}`);
   if (ownsLogger && resolvedLogger.getCurrentLogFile) {
-    resolvedLogger.log(`Logs:   ${resolvedLogger.getCurrentLogFile()}`);
+    resolvedLogger.log(`Logs:     ${resolvedLogger.getCurrentLogFile()}`);
   }
 
   let stopping = false;
@@ -172,7 +204,9 @@ export async function startApp({
 
   return {
     ...binding,
+    settingsPath,
     logDir,
+    runsDir: resolvedSettings.worker.runs_dir,
     transports,
     workerTransport,
     httpTransport,

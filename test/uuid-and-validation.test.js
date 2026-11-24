@@ -3,12 +3,22 @@ import test from "node:test";
 import { ValidationError } from "../src/utilities/errors.js";
 import { generateUuidV7, isUuidV7 } from "../src/utilities/uuid.js";
 import {
+  assertAgentName,
   assertNonEmptyString,
   assertNullableUuidV7,
+  assertOptionalAgentName,
+  assertOptionalPermissionMode,
+  assertOptionalTaskStatus,
+  assertPaginationInt,
   assertPlainObject,
   assertString,
+  assertTaskExecution,
   assertTaskPriority,
+  assertUuidV7,
+  PERMISSION_MODES,
+  SUPPORTED_AGENTS,
   TASK_PRIORITIES,
+  TASK_STATUSES,
 } from "../src/utilities/validation.js";
 
 test("generateUuidV7 creates valid RFC 9562 v7 UUIDs with embedded timestamp", () => {
@@ -49,7 +59,7 @@ test("isUuidV7 rejects v4 and malformed UUIDs", () => {
   assert.equal(isUuidV7(null), false);
 });
 
-test("validation helpers enforce task field rules", () => {
+test("validation helpers enforce task and execution field rules", () => {
   assert.deepEqual(assertPlainObject({ a: 1 }), { a: 1 });
   assert.throws(() => assertPlainObject([]), ValidationError);
 
@@ -65,6 +75,8 @@ test("validation helpers enforce task field rules", () => {
 
   const upper = generateUuidV7().toUpperCase();
   assert.equal(assertNullableUuidV7(upper, "parent_id"), upper.toLowerCase());
+  assert.equal(assertUuidV7(upper, "id"), upper.toLowerCase());
+  assert.throws(() => assertUuidV7(null, "id"), ValidationError);
   assert.throws(
     () => assertNullableUuidV7("550e8400-e29b-41d4-a716-446655440000", "parent_id"),
     ValidationError,
@@ -75,4 +87,64 @@ test("validation helpers enforce task field rules", () => {
   }
   assert.throws(() => assertTaskPriority("P4"), ValidationError);
   assert.throws(() => assertTaskPriority("high"), ValidationError);
+
+  for (const agent of SUPPORTED_AGENTS) {
+    assert.equal(assertAgentName(agent), agent);
+    assert.equal(assertOptionalAgentName(agent), agent);
+  }
+  assert.equal(assertOptionalAgentName(undefined), null);
+  assert.equal(assertOptionalAgentName(""), null);
+  assert.throws(() => assertAgentName("unknown"), ValidationError);
+
+  for (const mode of PERMISSION_MODES) {
+    assert.equal(assertOptionalPermissionMode(mode), mode);
+  }
+  assert.equal(assertOptionalPermissionMode(null), null);
+  assert.throws(() => assertOptionalPermissionMode("root"), ValidationError);
+
+  for (const status of TASK_STATUSES) {
+    assert.equal(assertOptionalTaskStatus(status), status);
+  }
+  assert.equal(assertOptionalTaskStatus(undefined), null);
+  assert.throws(() => assertOptionalTaskStatus("pending"), ValidationError);
+
+  assert.equal(assertPaginationInt(undefined, "limit", { min: 1, max: 200, defaultValue: 50 }), 50);
+  assert.equal(assertPaginationInt("25", "limit", { min: 1, max: 200, defaultValue: 50 }), 25);
+  assert.throws(() => assertPaginationInt("0", "limit", { min: 1, max: 200, defaultValue: 50 }), ValidationError);
+  assert.throws(() => assertPaginationInt("201", "limit", { min: 1, max: 200, defaultValue: 50 }), ValidationError);
+
+  assert.deepEqual(
+    assertTaskExecution({
+      agent: "codex",
+      model: " gpt-5 ",
+      effort: "medium",
+      cwd: "/tmp/repo",
+      permission_mode: "workspace",
+      timeout_ms: 120000,
+      session_id: "thread_1",
+    }),
+    {
+      agent: "codex",
+      model: "gpt-5",
+      effort: "medium",
+      cwd: "/tmp/repo",
+      permission_mode: "workspace",
+      timeout_ms: 120000,
+      session_id: "thread_1",
+    },
+  );
+
+  assert.deepEqual(assertTaskExecution({ agent: "agy" }), {
+    agent: "agy",
+    model: null,
+    effort: null,
+    cwd: null,
+    permission_mode: null,
+    timeout_ms: null,
+    session_id: null,
+  });
+
+  assert.throws(() => assertTaskExecution({ agent: "agy", extra: 1 }), ValidationError);
+  assert.throws(() => assertTaskExecution({ agent: "codex", timeout_ms: -5 }), ValidationError);
+  assert.throws(() => assertTaskExecution(null), ValidationError);
 });

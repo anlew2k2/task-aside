@@ -1,22 +1,34 @@
 # task-aside
 
-Minimal, zero-dependency CLI exposing **1 HTTP/MCP server** and **1 sequential background worker** backed by Cloudflare Queues, ready to run directly with Node or Bun.
+Minimal, zero-dependency CLI exposing **1 HTTP/MCP server** and **1 sequential background worker** backed by Supabase Postgres/PostgREST, executing tasks via headless agent CLIs (`agy`, `claude`, `codex`), ready to run directly with Node or Bun.
 
-## Configuration
+## Global Settings (`~/.task-aside/settings.json`)
 
-Set the required Cloudflare Queue environment variables (or place them in `.env`):
+On startup, `task-aside` reads `~/.task-aside/settings.json` (or the path passed via `-c, --config`). If the file does not exist, it is created automatically with defaults (`0o600`). Logs, per-run artifacts, and settings all live under `~/.task-aside/` by default.
 
-- `CLOUDFLARE_ACCOUNT_ID` — Cloudflare account ID
-- `CLOUDFLARE_API_TOKEN` — API token with Queues Read & Write permissions
-- `CLOUDFLARE_TASKS_QUEUE_ID` — Cloudflare Queue ID for tasks
-- `CLOUDFLARE_API_BASE_URL` *(optional)* — Defaults to `https://api.cloudflare.com/client/v4`
-- `CLOUDFLARE_VISIBILITY_TIMEOUT_MS` *(optional)* — Pull lease timeout in ms (default: `30000`)
-- `HOST` *(optional)* — HTTP/MCP bind host (default: `127.0.0.1`; overridden by `-H, --host`)
-- `PORT` *(optional)* — HTTP/MCP bind port (default: `3100`; overridden by `-p, --port`)
-- `ENABLE_HTTP` *(optional)* — Enable HTTP `/tasks` endpoint (`true`/`false`, default: `true`)
-- `ENABLE_MCP` *(optional)* — Enable MCP `/mcp` endpoint (`true`/`false`, default: `true`)
-- `ENABLE_WORKER` *(optional)* — Enable background queue worker (`true`/`false`, default: `true`)
-- `LOG_DIR` *(optional)* — Directory for daily-rotated log files (`task-aside-YYYY-MM-DD.log`, default: `./logs`)
+Key groups in `~/.task-aside/settings.json`:
+
+- `server`: `{ "host": "127.0.0.1", "port": 3100 }`
+- `transports`: `{ "http": true, "mcp": true, "worker": true }`
+- `supabase`: `{ "url": "https://<project>.supabase.co", "publishable_key": "<key>", "schema": "public", "table": "tasks" }`
+- `logging`: `{ "dir": "~/.task-aside/logs" }`
+- `worker`:
+  - `worker_id`: Optional worker identifier (`null` defaults to `<hostname>-<pid>`)
+  - `poll_interval_ms`: Sequential polling interval (default: `1000`)
+  - `lease_seconds`: Task claim lease duration in seconds (default: `120`)
+  - `heartbeat_interval_ms`: Lease extension interval in ms (default: `30000`)
+  - `runs_dir`: Per-run artifact directory (default: `"~/.task-aside/runs"`)
+  - `allowed_agents`: Worker agent allowlist (default: `["agy", "claude", "codex"]`)
+  - `default_permission_mode`: Default permission policy (`"read-only" | "workspace" | "full"`, default: `"workspace"`)
+  - `max_permission_mode`: Maximum permission policy ceiling allowed by this worker (default: `"workspace"`)
+  - `default_cwd`: Default working directory (`""` falls back to `process.cwd()`)
+  - `allowed_cwd_roots`: Optional array of allowed root directories (`[]` allows any existing directory)
+  - `default_timeout_ms`: Default execution timeout in ms (default: `600000`)
+  - `agents`: Per-agent CLI overrides (`agy`, `claude`, `codex` executables, default model/effort, `codex.skip_git_repo_check`)
+
+## Supabase Schema
+
+Apply `migrations/schema.sql` to your Supabase Postgres database before running. It provisions `public.tasks` and the `claim_next_task` / `extend_task_lease` RPC functions.
 
 ## Run
 
@@ -34,14 +46,15 @@ node ./bin/task-aside.js
 
 ## Options
 
-- `-p, --port <port>` — HTTP/MCP port (default: `PORT` env var or `3100`)
-- `-H, --host <host>` — Bind host (default: `HOST` env var or `127.0.0.1`)
+- `-c, --config <path>` — Path to `settings.json` (default: `~/.task-aside/settings.json`)
+- `-p, --port <port>` — HTTP/MCP port (overrides `settings.json` `server.port`)
+- `-H, --host <host>` — Bind host (overrides `settings.json` `server.host`)
 - `-h, --help` — Show help
 - `-v, --version` — Show version
 
 ## Task Message Format (`v1`)
 
-Both HTTP (`POST /tasks`) and MCP (`create_task`) validate input, enqueue the `v1` envelope onto Cloudflare Queue, and return:
+Both HTTP (`POST /tasks`) and MCP (`create_task`) validate input, persist the `v1` envelope to Supabase, and return:
 
 ```json
 {
@@ -50,24 +63,86 @@ Both HTTP (`POST /tasks`) and MCP (`create_task`) validate input, enqueue the `v
   },
   "metadata": {
     "created_at": "2025-11-24T12:23:49.000Z",
-    "updated_at": "2025-11-24T12:23:49.000Z"
+    "updated_at": "2025-11-24T12:23:49.000Z",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "00f067aa0ba902b7"
   },
   "data": {
     "id": "01935e8b-0000-7000-8000-000000000000",
     "title": "Task title",
     "description": "## Markdown details",
     "parent_id": null,
-    "priority": "P1"
+    "priority": "P1",
+    "execution": {
+      "agent": "codex",
+      "model": null,
+      "effort": "medium",
+      "cwd": null,
+      "permission_mode": "workspace",
+      "timeout_ms": null,
+      "session_id": null
+    }
   }
 }
 ```
 
-- `data.id`: Server-generated UUID v7
-- `data.title`: Non-empty string
-- `data.description`: String (Markdown)
-- `data.parent_id`: UUID v7 string or `null`
-- `data.priority`: One of `P0`, `P1`, `P2`, `P3`
-- `metadata.created_at`, `metadata.updated_at`: ISO 8601 UTC timestamp
+## Task Result Envelope (`v1` / `task_result`)
+
+When the worker finishes (or fails/times out/is interrupted), it writes `~/.task-aside/runs/<task_id>/result.json` and persists `result_envelope` to Supabase:
+
+```json
+{
+  "schema": {
+    "version": "v1",
+    "type": "task_result"
+  },
+  "metadata": {
+    "created_at": "2025-11-24T12:25:10.000Z",
+    "updated_at": "2025-11-24T12:25:10.000Z",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "1a2b3c4d5e6f7a8b",
+    "parent_span_id": "00f067aa0ba902b7"
+  },
+  "data": {
+    "id": "01935e8c-0000-7000-8000-000000000000",
+    "task_id": "01935e8b-0000-7000-8000-000000000000",
+    "parent_id": null,
+    "status": "completed",
+    "execution": {
+      "agent": "codex",
+      "worker_id": "host-1234",
+      "requested_model": null,
+      "effective_model": "gpt-5",
+      "effort": "medium",
+      "cwd": "/path/to/repo",
+      "permission_mode": "workspace",
+      "enforcement": "sandbox",
+      "session_id": "thread_123",
+      "exit_code": 0,
+      "started_at": "2025-11-24T12:23:50.000Z",
+      "finished_at": "2025-11-24T12:25:10.000Z",
+      "duration_ms": 80000
+    },
+    "output": {
+      "format": "markdown",
+      "text": "Completed the task."
+    },
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 350,
+      "total_cost_usd": null
+    },
+    "artifacts": {
+      "run_dir": "~/.task-aside/runs/01935e8b-0000-7000-8000-000000000000",
+      "prompt_file": "~/.task-aside/runs/01935e8b-0000-7000-8000-000000000000/prompt.md",
+      "result_file": "~/.task-aside/runs/01935e8b-0000-7000-8000-000000000000/result.json",
+      "raw_output_file": "~/.task-aside/runs/01935e8b-0000-7000-8000-000000000000/events.jsonl",
+      "log_file": "~/.task-aside/runs/01935e8b-0000-7000-8000-000000000000/agent.log"
+    },
+    "error": null
+  }
+}
+```
 
 ## Endpoints & MCP Tools
 
@@ -76,42 +151,50 @@ curl -s http://127.0.0.1:3100/health
 
 curl -s -X POST http://127.0.0.1:3100/tasks \
   -H 'content-type: application/json' \
-  -d '{"title":"Demo task","description":"**Markdown** body","parent_id":null,"priority":"P1"}'
+  -d '{"title":"Demo task","description":"**Markdown** body","parent_id":null,"priority":"P1","execution":{"agent":"codex"}}'
 
-curl -s http://127.0.0.1:3100/mcp \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+curl -s 'http://127.0.0.1:3100/tasks?status=completed&limit=20'
+curl -s http://127.0.0.1:3100/tasks/<uuid-v7>
 ```
 
-Built-in MCP tool:
+Built-in MCP tools:
 
-- `create_task` — create a task (`title`, `description`, optional `parent_id`, `priority`) and push it to Cloudflare Queue
-
-## Background Worker
-
-The worker polls Cloudflare Queue (`batch_size: 1`) and processes messages sequentially one at a time. The current worker implementation sleeps for 5 seconds per message, logs the task payload, and acknowledges the message.
+- `create_task` — create a task (`title`, `description`, `priority`, `execution`, optional `parent_id`)
+- `get_task` — fetch a task and its `result` envelope by `id`
+- `list_tasks` — list tasks with optional `status`, `agent`, `parent_id`, `limit`, `offset` filters
 
 ## Test
 
 ```bash
 npm test
-# Run live Cloudflare Queue integration test using .env
+# Run live Supabase integration test using ~/.task-aside/settings.json
 npm run test:live
 ```
 
+## Documentation
+
+High-level architecture and sequence flows live in `docs/`:
+
+- [Architecture Overview](./docs/architecture.md)
+- [Task Intake & Queries](./docs/seq-task-intake.md)
+- [Worker Execution](./docs/seq-worker-execution.md)
+- [Recovery, Breakdown & HITL](./docs/seq-recovery-and-hitl.md)
+
 ## Layout
 
-See [AGENTS.md](./AGENTS.md) for strict layer dependency rules.
+See [AGENTS.md](./AGENTS.md) for strict layer dependency rules and live documentation maintenance.
 
 ```text
 bin/task-aside.js    CLI entrypoint
+docs/                High-level architecture and sequence docs
+migrations/          Supabase Postgres schema and RPC migrations
 src/index.js         Composition root (DI wiring)
 src/transports/      HTTP, MCP, and background worker transports
 src/handlers/        Transport-agnostic entry points
 src/usecases/        Business logic
-src/services/        External integrations (Cloudflare Queue)
-src/repositories/    Data/database adapters
-src/utilities/       Shared utilities, UUID v7, env, logger, and errors
+src/services/        Headless agent harness service (agy, claude, codex)
+src/repositories/    Supabase PostgREST/RPC & in-memory task repositories
+src/utilities/       Shared utilities, settings, UUID v7, logger, and errors
 test/                Zero-dependency node:test suite
 ```
 

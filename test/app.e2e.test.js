@@ -1,136 +1,12 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { startApp } from "../src/index.js";
+import { createInMemoryTaskRepository } from "../src/repositories/task.repository.js";
 import { ConfigError } from "../src/utilities/errors.js";
 import { generateUuidV7, isUuidV7 } from "../src/utilities/uuid.js";
-
-function createMockCloudflareQueueServer() {
-  const pending = [];
-  const inFlight = new Map();
-  const acked = [];
-  const retried = [];
-  let maxInFlight = 0;
-  let failNextEnqueue = false;
-
-  const server = createServer(async (req, res) => {
-    const chunks = [];
-    for await (const chunk of req) {
-      chunks.push(chunk);
-    }
-    const raw = Buffer.concat(chunks).toString("utf8");
-    const body = raw ? JSON.parse(raw) : {};
-    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
-
-    if (pathname.endsWith("/messages")) {
-      if (failNextEnqueue) {
-        failNextEnqueue = false;
-        res.writeHead(503, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            success: false,
-            errors: [{ code: 5000, message: "Queue temporarily unavailable" }],
-          }),
-        );
-        return;
-      }
-
-      pending.push({
-        id: randomUUID(),
-        body: body.body,
-        attempts: 0,
-        timestamp_ms: Date.now(),
-      });
-
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ success: true, errors: [], messages: [], result: null }));
-      return;
-    }
-
-    if (pathname.endsWith("/messages/pull")) {
-      const batchSize = Math.max(1, body.batch_size ?? 1);
-      const pulled = [];
-      while (pulled.length < batchSize && pending.length > 0) {
-        const msg = pending.shift();
-        msg.attempts += 1;
-        const leaseId = randomUUID();
-        inFlight.set(leaseId, msg);
-        if (inFlight.size > maxInFlight) {
-          maxInFlight = inFlight.size;
-        }
-        pulled.push({
-          id: msg.id,
-          lease_id: leaseId,
-          attempts: msg.attempts,
-          timestamp_ms: msg.timestamp_ms,
-          body: msg.body,
-        });
-      }
-
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          success: true,
-          errors: [],
-          messages: [],
-          result: { messages: pulled },
-        }),
-      );
-      return;
-    }
-
-    if (pathname.endsWith("/messages/ack")) {
-      for (const item of body.acks ?? []) {
-        const msg = inFlight.get(item.lease_id);
-        if (msg) {
-          inFlight.delete(item.lease_id);
-          acked.push(msg.body);
-        }
-      }
-      for (const item of body.retries ?? []) {
-        const msg = inFlight.get(item.lease_id);
-        if (msg) {
-          inFlight.delete(item.lease_id);
-          retried.push(msg.body);
-          pending.push(msg);
-        }
-      }
-
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ success: true, errors: [], messages: [], result: null }));
-      return;
-    }
-
-    res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: false, errors: [{ message: "Not Found" }] }));
-  });
-
-  return {
-    async start() {
-      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-      const addr = server.address();
-      return {
-        apiBaseUrl: `http://127.0.0.1:${addr.port}/client/v4`,
-      };
-    },
-    async close() {
-      await new Promise((resolve) => server.close(resolve));
-    },
-    setFailNextEnqueue(flag) {
-      failNextEnqueue = flag;
-    },
-    getState() {
-      return {
-        pendingCount: pending.length,
-        inFlightCount: inFlight.size,
-        maxInFlight,
-        acked: structuredClone(acked),
-        retried: structuredClone(retried),
-      };
-    },
-  };
-}
 
 function createMemoryLogger() {
   const logs = [];
@@ -150,7 +26,7 @@ function createMemoryLogger() {
 async function waitFor(predicate, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) {
+    if (await predicate()) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 15));
@@ -158,42 +34,58 @@ async function waitFor(predicate, timeoutMs = 5_000) {
   throw new Error(`Timed out after ${timeoutMs}ms waiting for condition`);
 }
 
+function makeTestSettings(dir, overrides = {}) {
+  return {
+    server: { host: "127.0.0.1", port: 0 },
+    transports: { http: true, mcp: true, worker: false },
+    supabase: { url: "", publishable_key: "", schema: "public", table: "tasks" },
+    logging: { dir: join(dir, "logs") },
+    worker: {
+      worker_id: "e2e-worker",
+      poll_interval_ms: 15,
+      lease_seconds: 60,
+      heartbeat_interval_ms: 5000,
+      runs_dir: join(dir, "runs"),
+      allowed_agents: ["agy", "claude", "codex"],
+      default_permission_mode: "workspace",
+      max_permission_mode: "workspace",
+      default_cwd: dir,
+      allowed_cwd_roots: [],
+      default_timeout_ms: 5_000,
+      ...overrides.worker,
+    },
+    ...overrides,
+  };
+}
+
 function assertTaskEnvelope(task, expected) {
   assert.deepEqual(Object.keys(task).sort(), ["data", "metadata", "schema"]);
   assert.deepEqual(task.schema, { version: "v1" });
 
   const isoRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-  assert.equal(typeof task.metadata.created_at, "string");
-  assert.equal(typeof task.metadata.updated_at, "string");
   assert.match(task.metadata.created_at, isoRegex);
   assert.equal(task.metadata.created_at, task.metadata.updated_at);
-  assert.ok(Date.parse(task.metadata.created_at) > 1_700_000_000_000);
+  assert.match(task.metadata.trace_id, /^[0-9a-f]{32}$/);
+  assert.match(task.metadata.span_id, /^[0-9a-f]{16}$/);
 
   assert.equal(isUuidV7(task.data.id), true);
   assert.equal(task.data.title, expected.title);
   assert.equal(task.data.description, expected.description);
   assert.equal(task.data.parent_id, expected.parent_id);
   assert.equal(task.data.priority, expected.priority);
+  assert.equal(task.data.execution.agent, expected.agent);
 }
 
-test("HTTP and MCP create_task expose v1 envelope and push to Cloudflare Queue", async (t) => {
-  const cfMock = createMockCloudflareQueueServer();
-  const { apiBaseUrl } = await cfMock.start();
-  t.after(() => cfMock.close());
+test("HTTP and MCP expose create_task, get_task, and list_tasks with v1 envelopes", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-api-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
 
-  const logger = createMemoryLogger();
+  const taskRepository = createInMemoryTaskRepository();
   const app = await startApp({
-    host: "127.0.0.1",
-    port: 0,
     installSignalHandlers: false,
-    startWorker: false,
-    logger,
-    env: {
-      CLOUDFLARE_ACCOUNT_ID: "acc-test",
-      CLOUDFLARE_API_TOKEN: "tok-test",
-      CLOUDFLARE_TASKS_QUEUE_ID: "queue-test",
-      CLOUDFLARE_API_BASE_URL: apiBaseUrl,
-    },
+    taskRepository,
+    settings: makeTestSettings(dir),
+    logger: createMemoryLogger(),
   });
   t.after(() => app.stop());
 
@@ -202,96 +94,89 @@ test("HTTP and MCP create_task expose v1 envelope and push to Cloudflare Queue",
   assert.equal(healthRes.status, 200);
   const health = await healthRes.json();
   assert.equal(health.ok, true);
-  assert.equal(health.worker.provider, "cloudflare");
+  assert.equal(health.worker.provider, "in-memory");
 
-  // HTTP POST /tasks with parent_id null
+  // HTTP POST /tasks
   const httpRes1 = await fetch(`${app.url}/tasks`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      title: "Implement queue producer",
-      description: "## Details\n- Push to CF Queue",
+      title: "Implement worker",
+      description: "## Details\n- Use headless CLI",
       parent_id: null,
       priority: "P0",
+      execution: { agent: "codex", effort: "medium" },
     }),
   });
   assert.equal(httpRes1.status, 201);
   const httpTask1 = await httpRes1.json();
   assertTaskEnvelope(httpTask1, {
-    title: "Implement queue producer",
-    description: "## Details\n- Push to CF Queue",
+    title: "Implement worker",
+    description: "## Details\n- Use headless CLI",
     parent_id: null,
     priority: "P0",
+    agent: "codex",
   });
 
-  // HTTP POST /tasks with parent_id UUID v7
-  const parentId = generateUuidV7();
+  // HTTP POST /tasks with parent_id
   const httpRes2 = await fetch(`${app.url}/tasks`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       title: "Subtask",
       description: "Child task",
-      parent_id: parentId.toUpperCase(),
+      parent_id: httpTask1.data.id.toUpperCase(),
       priority: "P2",
+      execution: { agent: "claude" },
     }),
   });
   assert.equal(httpRes2.status, 201);
   const httpTask2 = await httpRes2.json();
-  assertTaskEnvelope(httpTask2, {
-    title: "Subtask",
-    description: "Child task",
-    parent_id: parentId.toLowerCase(),
-    priority: "P2",
-  });
+  assert.equal(httpTask2.data.parent_id, httpTask1.data.id);
 
-  // HTTP validation & method errors
+  // Validation errors
   const badRes = await fetch(`${app.url}/tasks`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      title: "",
+      title: "Missing execution",
       description: "x",
-      priority: "P9",
+      priority: "P1",
     }),
   });
   assert.equal(badRes.status, 400);
 
-  const methodRes = await fetch(`${app.url}/tasks`, { method: "GET" });
-  assert.equal(methodRes.status, 405);
+  // HTTP GET /tasks/:id and 404
+  const getRes = await fetch(`${app.url}/tasks/${httpTask1.data.id}`);
+  assert.equal(getRes.status, 200);
+  const fetched = await getRes.json();
+  assert.equal(fetched.id, httpTask1.data.id);
+  assert.equal(fetched.status, "queued");
 
-  // HTTP 502 when Cloudflare Queue rejects enqueue
-  cfMock.setFailNextEnqueue(true);
-  const cfErrRes = await fetch(`${app.url}/tasks`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      title: "Queue fail",
-      description: "Should fail",
-      priority: "P1",
-    }),
-  });
-  assert.equal(cfErrRes.status, 502);
+  const notFoundRes = await fetch(`${app.url}/tasks/${generateUuidV7()}`);
+  assert.equal(notFoundRes.status, 404);
+
+  // HTTP GET /tasks?agent=claude
+  const listHttpRes = await fetch(`${app.url}/tasks?agent=claude`);
+  assert.equal(listHttpRes.status, 200);
+  const listHttp = await listHttpRes.json();
+  assert.equal(listHttp.count, 1);
+  assert.equal(listHttp.tasks[0].id, httpTask2.data.id);
 
   // MCP tools/list
-  const listRes = await fetch(`${app.url}/mcp`, {
+  const listToolsRes = await fetch(`${app.url}/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/list",
-    }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
-  assert.equal(listRes.status, 200);
-  const listJson = await listRes.json();
+  const listToolsJson = await listToolsRes.json();
   assert.deepEqual(
-    listJson.result.tools.map((tool) => tool.name),
-    ["create_task"],
+    listToolsJson.result.tools.map((tool) => tool.name),
+    ["create_task", "get_task", "list_tasks"],
   );
 
-  // MCP tools/call create_task
-  const mcpCallRes = await fetch(`${app.url}/mcp`, {
+  // MCP create_task, get_task, list_tasks
+  const mcpCreateRes = await fetch(`${app.url}/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -301,362 +186,212 @@ test("HTTP and MCP create_task expose v1 envelope and push to Cloudflare Queue",
       params: {
         name: "create_task",
         arguments: {
-          title: "MCP task",
-          description: "- Bullet markdown",
+          title: "MCP agy task",
+          description: "- Bullet",
           parent_id: httpTask1.data.id,
           priority: "P3",
+          execution: { agent: "agy" },
         },
       },
     }),
   });
-  assert.equal(mcpCallRes.status, 200);
-  const mcpCallJson = await mcpCallRes.json();
-  const mcpTask = JSON.parse(mcpCallJson.result.content[0].text);
+  const mcpTask = JSON.parse((await mcpCreateRes.json()).result.content[0].text);
   assertTaskEnvelope(mcpTask, {
-    title: "MCP task",
-    description: "- Bullet markdown",
+    title: "MCP agy task",
+    description: "- Bullet",
     parent_id: httpTask1.data.id,
     priority: "P3",
+    agent: "agy",
   });
 
-  // MCP invalid params -> -32602
-  const mcpBadRes = await fetch(`${app.url}/mcp`, {
+  const mcpGetRes = await fetch(`${app.url}/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
-      params: {
-        name: "create_task",
-        arguments: {
-          title: "Missing priority",
-          description: "md",
-        },
-      },
+      params: { name: "get_task", arguments: { id: mcpTask.data.id } },
     }),
   });
-  const mcpBadJson = await mcpBadRes.json();
-  assert.equal(mcpBadJson.error.code, -32602);
+  const mcpGot = JSON.parse((await mcpGetRes.json()).result.content[0].text);
+  assert.equal(mcpGot.id, mcpTask.data.id);
 
-  assert.equal(cfMock.getState().pendingCount, 3);
-});
-
-test("Sequential worker pulls messages one at a time, sleeps, logs, and acks in order", async (t) => {
-  const cfMock = createMockCloudflareQueueServer();
-  const { apiBaseUrl } = await cfMock.start();
-  t.after(() => cfMock.close());
-
-  const logger = createMemoryLogger();
-  const mockDelayMs = 60;
-  const startMs = Date.now();
-
-  const app = await startApp({
-    host: "127.0.0.1",
-    port: 0,
-    installSignalHandlers: false,
-    workerIntervalMs: 15,
-    mockDelayMs,
-    logger,
-    env: {
-      CLOUDFLARE_ACCOUNT_ID: "acc-test",
-      CLOUDFLARE_API_TOKEN: "tok-test",
-      CLOUDFLARE_TASKS_QUEUE_ID: "queue-test",
-      CLOUDFLARE_API_BASE_URL: apiBaseUrl,
-    },
-  });
-  t.after(() => app.stop());
-
-  // Enqueue 3 tasks across HTTP and MCP
-  const t1 = await (
-    await fetch(`${app.url}/tasks`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        title: "First",
-        description: "1",
-        priority: "P0",
-      }),
-    })
-  ).json();
-
-  const t2 = JSON.parse(
-    (
-      await (
-        await fetch(`${app.url}/mcp`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: 10,
-            method: "tools/call",
-            params: {
-              name: "create_task",
-              arguments: {
-                title: "Second",
-                description: "2",
-                priority: "P1",
-              },
-            },
-          }),
-        })
-      ).json()
-    ).result.content[0].text,
-  );
-
-  const t3 = await (
-    await fetch(`${app.url}/tasks`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        title: "Third",
-        description: "3",
-        priority: "P2",
-      }),
-    })
-  ).json();
-
-  await waitFor(() => cfMock.getState().acked.length === 3);
-
-  const elapsedMs = Date.now() - startMs;
-  const state = cfMock.getState();
-
-  assert.equal(state.maxInFlight, 1);
-  assert.equal(state.pendingCount, 0);
-  assert.equal(state.inFlightCount, 0);
-  assert.deepEqual(
-    state.acked.map((m) => m.data.id),
-    [t1.data.id, t2.data.id, t3.data.id],
-  );
-  assert.ok(
-    elapsedMs >= mockDelayMs * 3 - 20,
-    `Expected sequential elapsed >= ${mockDelayMs * 3 - 20}ms, got ${elapsedMs}ms`,
-  );
-
-  const workerLogs = logger.logs.filter(
-    (entry) => typeof entry[0] === "string" && entry[0].includes("[worker] Processed task"),
-  );
-  assert.equal(workerLogs.length, 3);
-  assert.match(workerLogs[0][0], new RegExp(t1.data.id));
-  assert.match(workerLogs[1][0], new RegExp(t2.data.id));
-  assert.match(workerLogs[2][0], new RegExp(t3.data.id));
-});
-
-test("Worker retries (nacks) on execution failure and shuts down promptly on active sleep", async (t) => {
-  const cfMock = createMockCloudflareQueueServer();
-  const { apiBaseUrl } = await cfMock.start();
-  t.after(() => cfMock.close());
-
-  const logger = createMemoryLogger();
-  let attempt = 0;
-
-  const app = await startApp({
-    host: "127.0.0.1",
-    port: 0,
-    installSignalHandlers: false,
-    workerIntervalMs: 15,
-    logger,
-    executeTask: async (task) => {
-      attempt += 1;
-      if (attempt === 1) {
-        throw new Error("Transient failure");
-      }
-      return { ok: true, id: task.data.id };
-    },
-    env: {
-      CLOUDFLARE_ACCOUNT_ID: "acc-test",
-      CLOUDFLARE_API_TOKEN: "tok-test",
-      CLOUDFLARE_TASKS_QUEUE_ID: "queue-test",
-      CLOUDFLARE_API_BASE_URL: apiBaseUrl,
-    },
-  });
-
-  await fetch(`${app.url}/tasks`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      title: "Retryable task",
-      description: "Fails once then succeeds",
-      priority: "P1",
-    }),
-  });
-
-  await waitFor(() => cfMock.getState().acked.length === 1);
-  assert.equal(cfMock.getState().retried.length, 1);
-  await app.stop();
-
-  // Verify graceful shutdown aborts default 5000ms sleep promptly without acking
-  const cfMock2 = createMockCloudflareQueueServer();
-  const { apiBaseUrl: apiBaseUrl2 } = await cfMock2.start();
-  t.after(() => cfMock2.close());
-
-  const app2 = await startApp({
-    host: "127.0.0.1",
-    port: 0,
-    installSignalHandlers: false,
-    workerIntervalMs: 15,
-    mockDelayMs: 5_000,
-    logger: createMemoryLogger(),
-    env: {
-      CLOUDFLARE_ACCOUNT_ID: "acc-test",
-      CLOUDFLARE_API_TOKEN: "tok-test",
-      CLOUDFLARE_TASKS_QUEUE_ID: "queue-test",
-      CLOUDFLARE_API_BASE_URL: apiBaseUrl2,
-    },
-  });
-
-  await fetch(`${app2.url}/tasks`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      title: "Long sleep task",
-      description: "Interrupted by shutdown",
-      priority: "P0",
-    }),
-  });
-
-  await waitFor(() => cfMock2.getState().inFlightCount === 1);
-
-  const stopStart = Date.now();
-  await app2.stop();
-  const stopElapsed = Date.now() - stopStart;
-
-  assert.ok(stopElapsed < 500, `Expected stop() < 500ms, took ${stopElapsed}ms`);
-  assert.equal(cfMock2.getState().acked.length, 0);
-});
-
-test("ENABLE_HTTP, ENABLE_MCP, and ENABLE_WORKER toggle transports independently", async (t) => {
-  const cfMock = createMockCloudflareQueueServer();
-  const { apiBaseUrl } = await cfMock.start();
-  t.after(() => cfMock.close());
-
-  const baseEnv = {
-    CLOUDFLARE_ACCOUNT_ID: "acc-test",
-    CLOUDFLARE_API_TOKEN: "tok-test",
-    CLOUDFLARE_TASKS_QUEUE_ID: "queue-test",
-    CLOUDFLARE_API_BASE_URL: apiBaseUrl,
-  };
-
-  // 1. MCP-only mode (HTTP disabled, worker disabled)
-  const mcpOnly = await startApp({
-    host: "127.0.0.1",
-    port: 0,
-    installSignalHandlers: false,
-    logger: createMemoryLogger(),
-    env: {
-      ...baseEnv,
-      ENABLE_HTTP: "false",
-      ENABLE_MCP: "true",
-      ENABLE_WORKER: "false",
-    },
-  });
-  t.after(() => mcpOnly.stop());
-
-  assert.deepEqual(mcpOnly.transports, { http: false, mcp: true, worker: false });
-  assert.equal(mcpOnly.workerTransport.status().running, false);
-
-  const healthMcpOnly = await (await fetch(`${mcpOnly.url}/health`)).json();
-  assert.deepEqual(healthMcpOnly.transports, { http: false, mcp: true, worker: false });
-
-  const httpDisabledRes = await fetch(`${mcpOnly.url}/tasks`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ title: "Blocked", description: "x", priority: "P1" }),
-  });
-  assert.equal(httpDisabledRes.status, 404);
-
-  const mcpEnabledRes = await fetch(`${mcpOnly.url}/mcp`, {
+  const mcpListRes = await fetch(`${app.url}/mcp`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       jsonrpc: "2.0",
-      id: 1,
+      id: 4,
       method: "tools/call",
-      params: {
-        name: "create_task",
-        arguments: {
-          title: "MCP-only task",
-          description: "Queued while HTTP and worker are off",
-          priority: "P1",
+      params: { name: "list_tasks", arguments: { parent_id: httpTask1.data.id } },
+    }),
+  });
+  const mcpListed = JSON.parse((await mcpListRes.json()).result.content[0].text);
+  assert.equal(mcpListed.count, 2);
+});
+
+test("Worker claims allowed agents sequentially by priority and persists result_envelope", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-worker-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const fakeClaude = join(dir, "fake-claude.mjs");
+  writeFileSync(
+    fakeClaude,
+    `#!/usr/bin/env node
+process.stdin.resume();
+process.stdin.on("end", () => {
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: "Executed successfully",
+      session_id: "sess-abc",
+      usage: { input_tokens: 5, output_tokens: 7 }
+    }));
+  }, 30);
+});
+`,
+    "utf8",
+  );
+  chmodSync(fakeClaude, 0o755);
+
+  const taskRepository = createInMemoryTaskRepository();
+  const app = await startApp({
+    installSignalHandlers: false,
+    taskRepository,
+    settings: makeTestSettings(dir, {
+      transports: { http: true, mcp: false, worker: true },
+      worker: {
+        allowed_agents: ["claude"],
+        agents: {
+          agy: { executable: "agy", default_model: null, default_effort: null },
+          claude: { executable: fakeClaude, default_model: null, default_effort: null },
+          codex: { executable: "codex", default_model: null, default_effort: null, skip_git_repo_check: false },
         },
       },
     }),
-  });
-  assert.equal(mcpEnabledRes.status, 200);
-  await mcpOnly.stop();
-
-  // 2. HTTP-only mode (MCP disabled, worker disabled)
-  const httpOnly = await startApp({
-    host: "127.0.0.1",
-    port: 0,
-    installSignalHandlers: false,
     logger: createMemoryLogger(),
-    env: {
-      ...baseEnv,
-      ENABLE_HTTP: "true",
-      ENABLE_MCP: "false",
-      ENABLE_WORKER: "false",
-    },
   });
-  t.after(() => httpOnly.stop());
+  t.after(() => app.stop());
 
-  const httpEnabledRes = await fetch(`${httpOnly.url}/tasks`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      title: "HTTP-only task",
-      description: "Queued while MCP and worker are off",
-      priority: "P2",
+  // Enqueue: P2 claude, P0 agy (not in allowed_agents), P0 claude
+  const create = async (body) =>
+    (
+      await fetch(`${app.url}/tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      })
+    ).json();
+
+  const p2Claude = await create({
+    title: "Second priority",
+    description: "P2",
+    priority: "P2",
+    execution: { agent: "claude" },
+  });
+  const p0Agy = await create({
+    title: "Other agent",
+    description: "agy",
+    priority: "P0",
+    execution: { agent: "agy" },
+  });
+  const p0Claude = await create({
+    title: "First priority",
+    description: "P0",
+    priority: "P0",
+    execution: { agent: "claude" },
+  });
+
+  await waitFor(async () => {
+    const completed = await taskRepository.findAll({ status: "completed" });
+    return completed.length === 2;
+  });
+
+  const gotP0 = await taskRepository.findById(p0Claude.data.id);
+  const gotP2 = await taskRepository.findById(p2Claude.data.id);
+  const gotAgy = await taskRepository.findById(p0Agy.data.id);
+
+  assert.equal(gotP0.status, "completed");
+  assert.equal(gotP2.status, "completed");
+  assert.equal(gotAgy.status, "queued");
+  assert.ok(Date.parse(gotP0.finished_at) <= Date.parse(gotP2.started_at));
+  assert.equal(gotP0.result.schema.type, "task_result");
+  assert.equal(gotP0.result.data.output.text, "Executed successfully");
+  assert.equal(gotP0.result.data.execution.session_id, "sess-abc");
+});
+
+test("Worker persists interrupted status promptly on graceful shutdown", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-stop-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const slowCodex = join(dir, "slow-codex.mjs");
+  writeFileSync(
+    slowCodex,
+    `#!/usr/bin/env node
+setInterval(() => {}, 1000);
+`,
+    "utf8",
+  );
+  chmodSync(slowCodex, 0o755);
+
+  const taskRepository = createInMemoryTaskRepository();
+  const app = await startApp({
+    installSignalHandlers: false,
+    taskRepository,
+    settings: makeTestSettings(dir, {
+      transports: { http: true, mcp: false, worker: true },
+      worker: {
+        allowed_agents: ["codex"],
+        agents: {
+          agy: { executable: "agy", default_model: null, default_effort: null },
+          claude: { executable: "claude", default_model: null, default_effort: null },
+          codex: { executable: slowCodex, default_model: null, default_effort: null, skip_git_repo_check: false },
+        },
+      },
     }),
-  });
-  assert.equal(httpEnabledRes.status, 201);
-
-  const mcpDisabledRes = await fetch(`${httpOnly.url}/mcp`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
-  });
-  assert.equal(mcpDisabledRes.status, 404);
-  await httpOnly.stop();
-
-  // 3. Worker-only mode (HTTP disabled, MCP disabled -> no HTTP port bound, drains the 2 queued tasks)
-  const workerOnly = await startApp({
-    host: "127.0.0.1",
-    port: 0,
-    installSignalHandlers: false,
-    workerIntervalMs: 15,
-    mockDelayMs: 20,
     logger: createMemoryLogger(),
-    env: {
-      ...baseEnv,
-      ENABLE_HTTP: "false",
-      ENABLE_MCP: "false",
-      ENABLE_WORKER: "true",
-    },
   });
-  t.after(() => workerOnly.stop());
 
-  assert.equal(workerOnly.url, null);
-  assert.equal(workerOnly.httpTransport, null);
-  assert.equal(workerOnly.workerTransport.status().running, true);
+  const created = await (
+    await fetch(`${app.url}/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "Long task",
+        description: "Interrupted on stop",
+        priority: "P0",
+        execution: { agent: "codex" },
+      }),
+    })
+  ).json();
 
-  await waitFor(() => cfMock.getState().acked.length === 2);
-  await workerOnly.stop();
+  await waitFor(async () => (await taskRepository.findById(created.data.id))?.status === "running");
 
-  // 4. All transports disabled -> ConfigError
+  const stopStart = Date.now();
+  await app.stop();
+  const elapsed = Date.now() - stopStart;
+
+  assert.ok(elapsed < 2_000, `Expected stop() < 2000ms, took ${elapsed}ms`);
+  const after = await taskRepository.findById(created.data.id);
+  assert.equal(after.status, "interrupted");
+  assert.equal(after.result.data.status, "interrupted");
+});
+
+test("All transports disabled throws ConfigError", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-config-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
   await assert.rejects(
     () =>
       startApp({
-        host: "127.0.0.1",
-        port: 0,
         installSignalHandlers: false,
+        taskRepository: createInMemoryTaskRepository(),
+        settings: makeTestSettings(dir, {
+          transports: { http: false, mcp: false, worker: false },
+        }),
         logger: createMemoryLogger(),
-        env: {
-          ...baseEnv,
-          ENABLE_HTTP: "false",
-          ENABLE_MCP: "false",
-          ENABLE_WORKER: "false",
-        },
       }),
     (err) => err instanceof ConfigError,
   );

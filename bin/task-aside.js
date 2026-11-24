@@ -2,8 +2,8 @@
 
 import { parseArgs } from "node:util";
 import { startApp } from "../src/index.js";
-import { loadEnvFile } from "../src/utilities/env.js";
 import { getPackageInfo } from "../src/utilities/package-info.js";
+import { DEFAULT_SETTINGS_PATH } from "../src/utilities/settings.js";
 
 const { name, version } = getPackageInfo();
 
@@ -14,10 +14,11 @@ Usage:
   task-aside [options]
 
 Options:
-  -p, --port <port>   MCP HTTP port (default: $PORT or 3100)
-  -H, --host <host>   Bind host (default: $HOST or 127.0.0.1)
-  -h, --help          Show this help message
-  -v, --version       Show version`);
+  -c, --config <path>   Path to settings.json (default: ${DEFAULT_SETTINGS_PATH})
+  -p, --port <port>     HTTP/MCP port (overrides settings.json server.port)
+  -H, --host <host>     Bind host (overrides settings.json server.host)
+  -h, --help            Show this help message
+  -v, --version         Show version`);
 }
 
 function parseCliArgs(argv) {
@@ -26,6 +27,7 @@ function parseCliArgs(argv) {
     ({ values } = parseArgs({
       args: argv,
       options: {
+        config: { type: "string", short: "c" },
         port: { type: "string", short: "p" },
         host: { type: "string", short: "H" },
         help: { type: "boolean", short: "h", default: false },
@@ -66,14 +68,15 @@ function parseCliArgs(argv) {
 
   const trimmedHost = values.host?.trim();
   const host = trimmedHost ? trimmedHost : undefined;
+  const trimmedConfig = values.config?.trim();
+  const configPath = trimmedConfig ? trimmedConfig : undefined;
 
   return {
+    configPath,
     host,
     port,
   };
 }
-
-loadEnvFile();
 
 const config = parseCliArgs(process.argv.slice(2));
 

@@ -27,10 +27,18 @@ export class ConfigError extends AppError {
   }
 }
 
-export class QueueError extends AppError {
+export class StorageError extends AppError {
   constructor(message, { statusCode = null, details = null } = {}) {
-    super(message, "QUEUE_ERROR");
+    super(message, "STORAGE_ERROR");
     this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+
+export class AgentExecutionError extends AppError {
+  constructor(message, { code = "AGENT_EXECUTION_ERROR", category = "execution", details = null } = {}) {
+    super(message, code);
+    this.category = category;
     this.details = details;
   }
 }
