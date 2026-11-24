@@ -52,6 +52,8 @@ Local run without installing:
 
 ```bash
 node ./bin/task-aside.js
+# or via make (uses bun dev)
+make dev
 ```
 
 ## Options & Commands
@@ -231,5 +233,12 @@ test/                Zero-dependency node:test suite
 No build step required:
 
 ```bash
-npm publish
+# Preview release checks and commands without mutating git, npm, or GitHub
+DRY_RUN=1 make release
+
+# Run full release flow (tags current version if untagged, or bumps patch by default)
+make release
+
+# Explicit version bump (patch | minor | major | ...)
+make release BUMP=patch
 ```
