@@ -61,9 +61,16 @@ test(
       },
     };
 
-    const created = await repo.create(envelope);
+    const idempotencyKey = `live-idem-${Date.now()}`;
+    const requestHash = "live-hash-1";
+    const created = await repo.create(envelope, { idempotencyKey, requestHash });
     assert.equal(created.id, taskId);
     assert.equal(created.status, "queued");
+
+    const byIdem = await repo.findByIdempotencyKey(idempotencyKey);
+    assert.ok(byIdem);
+    assert.equal(byIdem.record.id, taskId);
+    assert.equal(byIdem.request_hash, requestHash);
 
     const claimed = await repo.claimNext({
       allowedAgents: ["codex"],
@@ -73,11 +80,21 @@ test(
     assert.ok(claimed);
     assert.equal(claimed.status, "running");
     assert.equal(claimed.worker_id, workerId);
+    assert.equal(claimed.attempts, 1);
+
+    const staleExtend = await repo.extendLease({
+      taskId: claimed.id,
+      workerId,
+      leaseSeconds: 120,
+      attempt: 999,
+    });
+    assert.equal(staleExtend, false);
 
     const extended = await repo.extendLease({
       taskId: claimed.id,
       workerId,
       leaseSeconds: 120,
+      attempt: claimed.attempts,
     });
     assert.equal(extended, true);
 
@@ -105,6 +122,7 @@ test(
           permission_mode: "workspace",
           enforcement: "sandbox",
           session_id: null,
+          worktree: null,
           exit_code: 0,
           started_at: nowIso,
           finished_at: nowIso,
@@ -120,6 +138,7 @@ test(
     const finished = await repo.finishTask({
       taskId: claimed.id,
       workerId,
+      attempt: claimed.attempts,
       status: "completed",
       resultEnvelope,
       finishedAt: new Date().toISOString(),
@@ -130,7 +149,14 @@ test(
     assert.equal(fetched.status, "completed");
     assert.equal(fetched.result.data.output.text, "Live test ok");
 
-    const listed = await repo.findAll({ status: "completed", limit: 20 });
-    assert.ok(listed.some((item) => item.id === claimed.id));
+    const listed = await repo.findAll({ status: "completed", limit: 20, summary: true });
+    const summaryItem = listed.find((item) => item.id === claimed.id);
+    assert.ok(summaryItem);
+    assert.equal(summaryItem.title, envelope.data.title);
+
+    const liveStats = await repo.stats();
+    assert.equal(liveStats.provider, "supabase");
+    assert.equal(typeof liveStats.counts.total, "number");
+    assert.ok("oldest_queued_age_ms" in liveStats);
   },
 );

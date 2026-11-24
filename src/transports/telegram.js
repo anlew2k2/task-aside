@@ -460,7 +460,7 @@ export function createTelegramTransport({
     } else {
       for (const task of tasks) {
         const badge = STATUS_BADGES[task.status] ?? task.status;
-        const title = truncateText(task.task?.data?.title ?? "Untitled", 52);
+        const title = truncateText(task.title ?? task.task?.data?.title ?? "Untitled", 52);
         lines.push(
           `${escapeHtml(badge)} | <code>${escapeHtml(task.agent)}</code> | ${escapeHtml(task.priority)} — ${escapeHtml(title)}`,
         );
@@ -730,6 +730,7 @@ export function createTelegramTransport({
         const { tasks } = await taskHandler.listTasks({
           ...(statusFilter ? { status: statusFilter } : {}),
           limit: 10,
+          summary: true,
         });
         const view = buildListMessage(tasks, statusFilter);
         await sendMessage({ chatId, text: view.text, replyMarkup: view.replyMarkup });
@@ -1000,6 +1001,7 @@ export function createTelegramTransport({
         const { tasks } = await taskHandler.listTasks({
           ...(statusFilter ? { status: statusFilter } : {}),
           limit: 10,
+          summary: true,
         });
         const view = buildListMessage(tasks, statusFilter);
         await editMessageText({

@@ -36,6 +36,7 @@ const EXECUTION_ALLOWED_KEYS = new Set([
   "permission_mode",
   "timeout_ms",
   "session_id",
+  "worktree",
 ]);
 
 export function isPlainObject(value) {
@@ -130,6 +131,30 @@ export function assertOptionalPositiveInteger(value, fieldName) {
   return value;
 }
 
+export function assertOptionalBoolean(value, fieldName, defaultValue = false) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== "boolean") {
+    throw new ValidationError(`Argument "${fieldName}" must be a boolean`);
+  }
+  return value;
+}
+
+export function assertOptionalIdempotencyKey(value, fieldName = "idempotency_key") {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new ValidationError(`Argument "${fieldName}" must be a non-empty string or null`);
+  }
+  const trimmed = value.trim();
+  if (trimmed.length > 256) {
+    throw new ValidationError(`Argument "${fieldName}" must be at most 256 characters`);
+  }
+  return trimmed;
+}
+
 export function assertTaskExecution(value, fieldName = "execution") {
   const execObj = assertPlainObject(value, `Argument "${fieldName}" must be an object`);
   for (const key of Object.keys(execObj)) {
@@ -149,6 +174,7 @@ export function assertTaskExecution(value, fieldName = "execution") {
     ),
     timeout_ms: assertOptionalPositiveInteger(execObj.timeout_ms, `${fieldName}.timeout_ms`),
     session_id: assertOptionalNonEmptyString(execObj.session_id, `${fieldName}.session_id`),
+    worktree: assertOptionalBoolean(execObj.worktree, `${fieldName}.worktree`, false),
   };
 }
 

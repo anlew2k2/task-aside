@@ -7,6 +7,8 @@ import {
   assertNonEmptyString,
   assertNullableUuidV7,
   assertOptionalAgentName,
+  assertOptionalBoolean,
+  assertOptionalIdempotencyKey,
   assertOptionalPermissionMode,
   assertOptionalTaskStatus,
   assertPaginationInt,
@@ -122,6 +124,7 @@ test("validation helpers enforce task and execution field rules", () => {
       permission_mode: "workspace",
       timeout_ms: 120000,
       session_id: "thread_1",
+      worktree: true,
     }),
     {
       agent: "codex",
@@ -131,6 +134,7 @@ test("validation helpers enforce task and execution field rules", () => {
       permission_mode: "workspace",
       timeout_ms: 120000,
       session_id: "thread_1",
+      worktree: true,
     },
   );
 
@@ -142,8 +146,20 @@ test("validation helpers enforce task and execution field rules", () => {
     permission_mode: null,
     timeout_ms: null,
     session_id: null,
+    worktree: false,
   });
 
+  assert.equal(assertOptionalBoolean(undefined, "flag", false), false);
+  assert.equal(assertOptionalBoolean(true, "flag", false), true);
+  assert.throws(() => assertOptionalBoolean("true", "flag", false), ValidationError);
+
+  assert.equal(assertOptionalIdempotencyKey(undefined), null);
+  assert.equal(assertOptionalIdempotencyKey(null), null);
+  assert.equal(assertOptionalIdempotencyKey("  req-123  "), "req-123");
+  assert.throws(() => assertOptionalIdempotencyKey("   "), ValidationError);
+  assert.throws(() => assertOptionalIdempotencyKey("x".repeat(257)), ValidationError);
+
+  assert.throws(() => assertTaskExecution({ agent: "agy", worktree: "yes" }), ValidationError);
   assert.throws(() => assertTaskExecution({ agent: "agy", extra: 1 }), ValidationError);
   assert.throws(() => assertTaskExecution({ agent: "codex", timeout_ms: -5 }), ValidationError);
   assert.throws(() => assertTaskExecution(null), ValidationError);

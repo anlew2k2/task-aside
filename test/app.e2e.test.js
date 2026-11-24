@@ -171,7 +171,7 @@ test("HTTP and MCP expose create_task, get_task, and list_tasks with v1 envelope
   const listToolsJson = await listToolsRes.json();
   assert.deepEqual(
     listToolsJson.result.tools.map((tool) => tool.name),
-    ["create_task", "get_task", "list_tasks", "cancel_task", "retry_task"],
+    ["create_task", "get_task", "list_tasks", "cancel_task", "retry_task", "get_capabilities"],
   );
 
   // MCP create_task, get_task, list_tasks
@@ -195,7 +195,9 @@ test("HTTP and MCP expose create_task, get_task, and list_tasks with v1 envelope
     }),
   });
   const mcpTask = JSON.parse((await mcpCreateRes.json()).result.content[0].text);
-  assertTaskEnvelope(mcpTask, {
+  assert.equal(mcpTask.poll_after_ms, 5000);
+  const { poll_after_ms: _ignoredPollAfterMs, ...mcpTaskEnvelope } = mcpTask;
+  assertTaskEnvelope(mcpTaskEnvelope, {
     title: "MCP agy task",
     description: "- Bullet",
     parent_id: httpTask1.data.id,
@@ -260,7 +262,7 @@ process.stdin.on("end", () => {
     installSignalHandlers: false,
     taskRepository,
     settings: makeTestSettings(dir, {
-      transports: { http: true, mcp: false, worker: true },
+      transports: { http: true, mcp: false, worker: false },
       worker: {
         allowed_agents: ["claude"],
         agents: {
@@ -302,6 +304,8 @@ process.stdin.on("end", () => {
     priority: "P0",
     execution: { agent: "claude" },
   });
+
+  app.workerTransport.start();
 
   await waitFor(async () => {
     const completed = await taskRepository.findAll({ status: "completed" });

@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { format } from "node:util";
+import { redactSecrets } from "#src/utilities/redaction.js";
 
 function pad2(value) {
   return String(value).padStart(2, "0");
@@ -46,6 +47,7 @@ export function createFileLogger({
   prefix = "task-aside",
   consoleSink = console,
   now = () => new Date(),
+  secrets = [],
 } = {}) {
   if (typeof dir !== "string" || dir.trim() === "") {
     throw new Error("Log directory path must be a non-empty string");
@@ -58,11 +60,15 @@ export function createFileLogger({
     return join(dir, `${prefix}-${formatLocalDate(date)}.log`);
   }
 
-  function writeLine(level, args) {
+  function formatAndRedact(args) {
+    return redactSecrets(format(...args), secrets);
+  }
+
+  function writeLine(level, message) {
     const date = now();
     const dateKey = formatLocalDate(date);
     const filePath = join(dir, `${prefix}-${dateKey}.log`);
-    const line = `[${formatLocalTimestamp(date)}] [${level}] ${format(...args)}\n`;
+    const line = `[${formatLocalTimestamp(date)}] [${level}] ${message}\n`;
 
     try {
       if (dateKey !== lastDateKey) {
@@ -98,20 +104,24 @@ export function createFileLogger({
       return getLogFilePath(now());
     },
     log(...args) {
-      writeLine("INFO", args);
-      consoleSink?.log?.(...args);
+      const message = formatAndRedact(args);
+      writeLine("INFO", message);
+      consoleSink?.log?.(message);
     },
     info(...args) {
-      writeLine("INFO", args);
-      consoleSink?.log?.(...args);
+      const message = formatAndRedact(args);
+      writeLine("INFO", message);
+      consoleSink?.log?.(message);
     },
     warn(...args) {
-      writeLine("WARN", args);
-      (consoleSink?.warn ?? consoleSink?.log)?.(...args);
+      const message = formatAndRedact(args);
+      writeLine("WARN", message);
+      (consoleSink?.warn ?? consoleSink?.log)?.(message);
     },
     error(...args) {
-      writeLine("ERROR", args);
-      consoleSink?.error?.(...args);
+      const message = formatAndRedact(args);
+      writeLine("ERROR", message);
+      consoleSink?.error?.(message);
     },
     async close() {},
   };

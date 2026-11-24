@@ -2,7 +2,7 @@
 
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
-import { authTelegram, startApp } from "#src/index.js";
+import { authTelegram, runDoctor, startApp, startStdioMcp } from "#src/index.js";
 import { getPackageInfo } from "#src/utilities/package-info.js";
 import { DEFAULT_SETTINGS_PATH } from "#src/utilities/settings.js";
 
@@ -13,6 +13,8 @@ function printHelp() {
 
 Usage:
   task-aside [options]
+  task-aside mcp [-c <path>]
+  task-aside doctor [-c <path>]
   task-aside auth telegram [-c <path>]
 
 Options:
@@ -125,6 +127,20 @@ if (positionals.length === 0) {
     console.error(`Failed to start ${name}: ${error.message}`);
     process.exit(1);
   });
+} else if (positionals.length === 1 && positionals[0] === "mcp") {
+  startStdioMcp({ configPath: config.configPath }).catch((error) => {
+    console.error(`Failed to start ${name} STDIO MCP: ${error.message}`);
+    process.exit(1);
+  });
+} else if (positionals.length === 1 && positionals[0] === "doctor") {
+  runDoctor({ configPath: config.configPath })
+    .then((report) => {
+      process.exit(report.ok ? 0 : 1);
+    })
+    .catch((error) => {
+      console.error(`Doctor check failed: ${error.message}`);
+      process.exit(1);
+    });
 } else if (positionals.length === 2 && positionals[0] === "auth" && positionals[1] === "telegram") {
   const controller = new AbortController();
   const abort = () => controller.abort();

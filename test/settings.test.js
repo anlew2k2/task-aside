@@ -44,6 +44,9 @@ test("loadSettings creates default settings.json with 0600 mode when missing", (
   assert.equal(settings.worker.agents.claude.default_effort, null);
   assert.equal(settings.worker.agents.codex.default_model, null);
   assert.equal(settings.worker.agents.codex.default_effort, null);
+  assert.equal(settings.worker.poll_max_interval_ms, 30000);
+  assert.equal(settings.worker.max_subtask_depth, 3);
+  assert.equal(settings.worker.max_subtasks_per_root, 20);
 
   const mode = statSync(configPath).mode & 0o777;
   assert.equal(mode, 0o600);
@@ -197,6 +200,35 @@ test("validateSettings rejects invalid config, empty allowed_workspaces, legacy 
         { requireSupabase: false },
       ),
     (err) => err instanceof ConfigError && /heartbeat_interval_ms/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          allowed_workspaces: ["~"],
+          worker: {
+            poll_interval_ms: 5000,
+            poll_max_interval_ms: 1000,
+          },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /poll_max_interval_ms/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          allowed_workspaces: ["~"],
+          worker: {
+            max_subtask_depth: 0,
+          },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /max_subtask_depth/.test(err.message),
   );
 });
 

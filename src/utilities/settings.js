@@ -47,6 +47,7 @@ export function createDefaultSettings() {
     worker: {
       worker_id: null,
       poll_interval_ms: 1000,
+      poll_max_interval_ms: 30000,
       lease_seconds: 120,
       heartbeat_interval_ms: 30000,
       runs_dir: "~/.task-aside/runs",
@@ -54,6 +55,8 @@ export function createDefaultSettings() {
       default_permission_mode: "workspace",
       max_permission_mode: "workspace",
       default_timeout_ms: 600000,
+      max_subtask_depth: 3,
+      max_subtasks_per_root: 20,
       agents: {
         agy: {
           executable: "agy",
@@ -292,6 +295,15 @@ export function validateSettings(
       : assertNonEmptyConfigString(w.worker_id, "worker.worker_id");
 
   const pollIntervalMs = assertPositiveConfigInt(w.poll_interval_ms, "worker.poll_interval_ms");
+  const pollMaxIntervalMs = assertPositiveConfigInt(
+    w.poll_max_interval_ms,
+    "worker.poll_max_interval_ms",
+  );
+  if (pollMaxIntervalMs < pollIntervalMs) {
+    throw new ConfigError(
+      "worker.poll_max_interval_ms must be greater than or equal to worker.poll_interval_ms",
+    );
+  }
   const leaseSeconds = assertPositiveConfigInt(w.lease_seconds, "worker.lease_seconds", {
     min: 10,
   });
@@ -353,6 +365,14 @@ export function validateSettings(
   const defaultTimeoutMs = assertPositiveConfigInt(
     w.default_timeout_ms,
     "worker.default_timeout_ms",
+  );
+  const maxSubtaskDepth = assertPositiveConfigInt(
+    w.max_subtask_depth,
+    "worker.max_subtask_depth",
+  );
+  const maxSubtasksPerRoot = assertPositiveConfigInt(
+    w.max_subtasks_per_root,
+    "worker.max_subtasks_per_root",
   );
 
   if (!isPlainObject(w.agents)) {
@@ -472,6 +492,7 @@ export function validateSettings(
     worker: {
       worker_id: workerId,
       poll_interval_ms: pollIntervalMs,
+      poll_max_interval_ms: pollMaxIntervalMs,
       lease_seconds: leaseSeconds,
       heartbeat_interval_ms: heartbeatIntervalMs,
       runs_dir: runsDir,
@@ -479,6 +500,8 @@ export function validateSettings(
       default_permission_mode: w.default_permission_mode,
       max_permission_mode: w.max_permission_mode,
       default_timeout_ms: defaultTimeoutMs,
+      max_subtask_depth: maxSubtaskDepth,
+      max_subtasks_per_root: maxSubtasksPerRoot,
       agents,
     },
   };

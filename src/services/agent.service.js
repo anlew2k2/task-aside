@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { createTraceContext } from "#src/utilities/otel.js";
+import { redactSecrets } from "#src/utilities/redaction.js";
 import { expandHomePath } from "#src/utilities/settings.js";
 import { generateUuidV7 } from "#src/utilities/uuid.js";
 import {
@@ -37,7 +38,10 @@ function emptyUsage() {
 /**
  * Render a structured Markdown prompt from a v1 task input envelope.
  */
-export function buildTaskPrompt(taskEnvelope, { permissionMode, allowedWorkspaces } = {}) {
+export function buildTaskPrompt(
+  taskEnvelope,
+  { permissionMode, allowedWorkspaces, worktreeBranch = null } = {},
+) {
   const data = taskEnvelope?.data ?? {};
   const metadata = taskEnvelope?.metadata ?? {};
 
@@ -52,6 +56,9 @@ export function buildTaskPrompt(taskEnvelope, { permissionMode, allowedWorkspace
   }
   if (metadata.trace_id) {
     lines.push(`- Trace ID: ${metadata.trace_id}`);
+  }
+  if (worktreeBranch) {
+    lines.push(`- Isolated Git Worktree Branch: ${worktreeBranch}`);
   }
 
   lines.push(
@@ -506,12 +513,55 @@ function summarizeStderr(stderr) {
   return lines.slice(-5).join("\n").slice(0, 1000);
 }
 
+function runGitCommand(args, { cwd, spawnImpl = spawn } = {}) {
+  return new Promise((resolveRun) => {
+    let child;
+    try {
+      child = spawnImpl("git", args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      resolveRun({ code: null, stdout: "", stderr: "", error });
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.once("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolveRun({ code: null, stdout, stderr, error });
+    });
+
+    child.once("close", (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolveRun({ code, stdout, stderr, error: null });
+    });
+  });
+}
+
 /**
  * Headless agent execution service for agy, claude, and codex.
  */
 export function createAgentService({
   workerConfig,
   allowedWorkspaces = [],
+  secrets = [],
   spawnImpl = spawn,
   now = () => Date.now(),
   generateId = generateUuidV7,
@@ -529,6 +579,7 @@ export function createAgentService({
     permissionMode,
     enforcement,
     sessionId,
+    worktree = null,
     exitCode,
     startedAtMs,
     finishedAtMs,
@@ -543,6 +594,13 @@ export function createAgentService({
       traceId: taskMeta.trace_id ?? null,
     });
     const createdAt = new Date(finishedAtMs).toISOString();
+    const safeOutputText = typeof outputText === "string" ? redactSecrets(outputText, secrets) : outputText;
+    const safeError = error
+      ? {
+          ...error,
+          message: typeof error.message === "string" ? redactSecrets(error.message, secrets) : error.message,
+        }
+      : null;
 
     return {
       schema: {
@@ -571,6 +629,7 @@ export function createAgentService({
           permission_mode: permissionMode,
           enforcement,
           session_id: sessionId,
+          worktree,
           exit_code: exitCode,
           started_at: new Date(startedAtMs).toISOString(),
           finished_at: createdAt,
@@ -578,11 +637,11 @@ export function createAgentService({
         },
         output: {
           format: "markdown",
-          text: outputText,
+          text: safeOutputText,
         },
         usage: usage ?? emptyUsage(),
         artifacts,
-        error,
+        error: safeError,
       },
     };
   }
@@ -730,14 +789,79 @@ export function createAgentService({
       );
     }
 
-    const promptText = buildTaskPrompt(taskEnvelope, { permissionMode, allowedWorkspaces });
+    let executionCwd = resolvedCwd;
+    let worktreeInfo = null;
+    if (execReq.worktree === true) {
+      const topRes = await runGitCommand(["rev-parse", "--show-toplevel"], {
+        cwd: resolvedCwd,
+        spawnImpl,
+      });
+      if (topRes.error || topRes.code !== 0 || !topRes.stdout.trim()) {
+        return failPreSpawn(
+          "INVALID_WORKTREE",
+          "validation",
+          `Working directory "${resolvedCwd}" is not inside a git repository`,
+        );
+      }
+
+      const repoRoot = realpathSync(topRes.stdout.trim());
+      const headRes = await runGitCommand(["rev-parse", "--verify", "HEAD"], {
+        cwd: repoRoot,
+        spawnImpl,
+      });
+      if (headRes.error || headRes.code !== 0 || !headRes.stdout.trim()) {
+        return failPreSpawn(
+          "INVALID_WORKTREE",
+          "validation",
+          "Git repository has no commits (HEAD is unborn)",
+        );
+      }
+
+      const baseCommit = headRes.stdout.trim();
+      const relSubdir = relative(repoRoot, resolvedCwd);
+      const shortId = String(taskId).replaceAll("-", "").slice(-12);
+      const branch = `task-aside/${shortId}${attempt > 1 ? `-a${attempt}` : ""}`;
+      const worktreeRoot = join(runDir, "worktree");
+
+      const addRes = await runGitCommand(
+        ["-C", repoRoot, "worktree", "add", "-b", branch, worktreeRoot, baseCommit],
+        { cwd: repoRoot, spawnImpl },
+      );
+      if (addRes.error || addRes.code !== 0) {
+        return failPreSpawn(
+          "WORKTREE_ERROR",
+          "environment",
+          redactSecrets(
+            `Failed to create git worktree: ${addRes.stderr.trim() || addRes.error?.message || "unknown error"}`,
+            secrets,
+          ),
+        );
+      }
+
+      worktreeInfo = {
+        repoRoot,
+        root: worktreeRoot,
+        branch,
+        baseCommit,
+      };
+      executionCwd = relSubdir ? join(worktreeRoot, relSubdir) : worktreeRoot;
+    }
+
+    const promptWorkspaces = worktreeInfo
+      ? [...allowedWorkspaces, worktreeInfo.root]
+      : allowedWorkspaces;
+    const promptText = buildTaskPrompt(taskEnvelope, {
+      permissionMode,
+      allowedWorkspaces: promptWorkspaces,
+      worktreeBranch: worktreeInfo?.branch ?? null,
+    });
     writeFileSync(promptPath, `${promptText}\n`, "utf8");
 
     const command = buildAgentCommand({
       agent,
       agentConfig,
       promptText,
-      cwd: resolvedCwd,
+      cwd: executionCwd,
       model: requestedModel,
       effort,
       permissionMode,
@@ -747,6 +871,29 @@ export function createAgentService({
     });
 
     if (signal?.aborted) {
+      let worktreeSummary = null;
+      if (worktreeInfo) {
+        await runGitCommand(
+          ["-C", worktreeInfo.repoRoot, "worktree", "remove", "--force", worktreeInfo.root],
+          { cwd: worktreeInfo.repoRoot, spawnImpl },
+        );
+        await runGitCommand(
+          ["-C", worktreeInfo.repoRoot, "branch", "-D", worktreeInfo.branch],
+          { cwd: worktreeInfo.repoRoot, spawnImpl },
+        );
+        worktreeSummary = {
+          enabled: true,
+          branch: worktreeInfo.branch,
+          base_commit: worktreeInfo.baseCommit,
+          path: null,
+          cleaned_up: true,
+          branch_kept: false,
+          has_uncommitted_changes: false,
+          commits_ahead: 0,
+          changed_files: [],
+          diff_stat: null,
+        };
+      }
       const finishedAtMs = now();
       const resultEnvelope = buildResultEnvelope({
         taskEnvelope,
@@ -755,10 +902,11 @@ export function createAgentService({
         requestedModel,
         effectiveModel: null,
         effort,
-        cwd: resolvedCwd,
+        cwd: executionCwd,
         permissionMode,
         enforcement: command.enforcement,
         sessionId: requestedSessionId,
+        worktree: worktreeSummary,
         exitCode: null,
         startedAtMs,
         finishedAtMs,
@@ -776,7 +924,7 @@ export function createAgentService({
     }
 
     logger.log(
-      `[agent] Spawning ${agent} task=${taskId} cwd=${resolvedCwd} permission=${permissionMode} timeoutMs=${timeoutMs}`,
+      `[agent] Spawning ${agent} task=${taskId} cwd=${executionCwd} permission=${permissionMode} timeoutMs=${timeoutMs}${worktreeInfo ? ` worktree=${worktreeInfo.branch}` : ""}`,
     );
 
     const rawOutStream = createWriteStream(rawOutputPath, { flags: "w" });
@@ -798,7 +946,7 @@ export function createAgentService({
       let child;
       try {
         child = spawnImpl(command.executable, command.args, {
-          cwd: resolvedCwd,
+          cwd: executionCwd,
           stdio: ["pipe", "pipe", "pipe"],
         });
       } catch (error) {
@@ -852,13 +1000,13 @@ export function createAgentService({
       child.stdout?.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         stdout += text;
-        rawOutStream.write(chunk);
+        rawOutStream.write(redactSecrets(text, secrets));
       });
 
       child.stderr?.on("data", (chunk) => {
         const text = chunk.toString("utf8");
         stderr += text;
-        logStream.write(chunk);
+        logStream.write(redactSecrets(text, secrets));
       });
 
       child.stdin?.on("error", () => {
@@ -877,7 +1025,7 @@ export function createAgentService({
         }
         settled = true;
         spawnError = error;
-        logStream.write(`\n[spawn error] ${error.message}\n`);
+        logStream.write(`\n[spawn error] ${redactSecrets(error.message, secrets)}\n`);
         cleanup();
         resolveRun();
       });
@@ -896,12 +1044,94 @@ export function createAgentService({
 
     await Promise.all([closeStream(rawOutStream), closeStream(logStream)]);
 
+    const redactedStdout = redactSecrets(stdout, secrets);
+    const redactedStderr = redactSecrets(stderr, secrets);
+    if (stdout.length > 0 && redactedStdout !== stdout) {
+      writeFileSync(rawOutputPath, redactedStdout, "utf8");
+    }
+    if (stderr.length > 0 && redactedStderr !== stderr) {
+      const suffix = spawnError ? `\n[spawn error] ${redactSecrets(spawnError.message, secrets)}\n` : "";
+      writeFileSync(logPath, `${redactedStderr}${suffix}`, "utf8");
+    }
+
     const finishedAtMs = now();
-    const lastMessageText =
+    let lastMessageText =
       lastMessagePath && existsSync(lastMessagePath)
         ? readFileSync(lastMessagePath, "utf8")
         : "";
-    const parsed = parseAgentOutput(agent, stdout, lastMessageText);
+    if (lastMessageText.length > 0) {
+      const redactedLastMessage = redactSecrets(lastMessageText, secrets);
+      if (redactedLastMessage !== lastMessageText) {
+        writeFileSync(lastMessagePath, redactedLastMessage, "utf8");
+        lastMessageText = redactedLastMessage;
+      }
+    }
+    const parsed = parseAgentOutput(agent, redactedStdout, lastMessageText);
+
+    let worktreeSummary = null;
+    if (worktreeInfo) {
+      const statusRes = await runGitCommand(["-C", worktreeInfo.root, "status", "--porcelain"], {
+        cwd: worktreeInfo.repoRoot,
+        spawnImpl,
+      });
+      const changedFiles = statusRes.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter(Boolean)
+        .map((line) => line.slice(3).trim())
+        .filter(Boolean);
+      const hasUncommittedChanges = changedFiles.length > 0;
+
+      const revRes = await runGitCommand(
+        ["-C", worktreeInfo.root, "rev-list", "--count", `${worktreeInfo.baseCommit}..HEAD`],
+        { cwd: worktreeInfo.repoRoot, spawnImpl },
+      );
+      const commitsAhead = Number.parseInt(revRes.stdout.trim(), 10) || 0;
+
+      const diffRes = await runGitCommand(
+        ["-C", worktreeInfo.root, "diff", "--stat", worktreeInfo.baseCommit],
+        { cwd: worktreeInfo.repoRoot, spawnImpl },
+      );
+      const rawDiffStat = diffRes.stdout.trim();
+      const diffStat = rawDiffStat ? redactSecrets(rawDiffStat, secrets).slice(0, 2000) : null;
+
+      let cleanedUp = false;
+      let branchKept = true;
+      let retainedPath = worktreeInfo.root;
+
+      if (!hasUncommittedChanges) {
+        const removeRes = await runGitCommand(
+          ["-C", worktreeInfo.repoRoot, "worktree", "remove", "--force", worktreeInfo.root],
+          { cwd: worktreeInfo.repoRoot, spawnImpl },
+        );
+        if (!removeRes.error && removeRes.code === 0) {
+          cleanedUp = true;
+          retainedPath = null;
+        }
+        if (commitsAhead === 0) {
+          const branchDelRes = await runGitCommand(
+            ["-C", worktreeInfo.repoRoot, "branch", "-D", worktreeInfo.branch],
+            { cwd: worktreeInfo.repoRoot, spawnImpl },
+          );
+          if (!branchDelRes.error && branchDelRes.code === 0) {
+            branchKept = false;
+          }
+        }
+      }
+
+      worktreeSummary = {
+        enabled: true,
+        branch: worktreeInfo.branch,
+        base_commit: worktreeInfo.baseCommit,
+        path: retainedPath,
+        cleaned_up: cleanedUp,
+        branch_kept: branchKept,
+        has_uncommitted_changes: hasUncommittedChanges,
+        commits_ahead: commitsAhead,
+        changed_files: changedFiles,
+        diff_stat: diffStat,
+      };
+    }
 
     let status;
     let error = null;
@@ -929,7 +1159,7 @@ export function createAgentService({
       };
     } else if (exitCode !== 0 || parsed.isError) {
       status = "failed";
-      const stderrSummary = summarizeStderr(stderr);
+      const stderrSummary = summarizeStderr(redactedStderr);
       error = {
         code: parsed.isError ? "AGENT_REPORTED_ERROR" : "NON_ZERO_EXIT",
         category: "execution",
@@ -949,14 +1179,17 @@ export function createAgentService({
       requestedModel,
       effectiveModel: parsed.effectiveModel,
       effort,
-      cwd: resolvedCwd,
+      cwd: executionCwd,
       permissionMode,
       enforcement: command.enforcement,
       sessionId: parsed.sessionId ?? requestedSessionId,
+      worktree: worktreeSummary,
       exitCode,
       startedAtMs,
       finishedAtMs,
-      outputText: parsed.text ?? (status === "completed" && stdout.trim() ? stdout.trim() : null),
+      outputText:
+        parsed.text ??
+        (status === "completed" && redactedStdout.trim() ? redactedStdout.trim() : null),
       usage: parsed.usage,
       artifacts,
       error,

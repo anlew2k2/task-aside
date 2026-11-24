@@ -1,7 +1,34 @@
-import { ConflictError, NotFoundError } from "#src/utilities/errors.js";
+import { createHash } from "node:crypto";
+import {
+  ConflictError,
+  NotFoundError,
+  StorageError,
+  ValidationError,
+} from "#src/utilities/errors.js";
 import { createTraceContext } from "#src/utilities/otel.js";
+import { redactSecrets } from "#src/utilities/redaction.js";
 import { generateUuidV7 } from "#src/utilities/uuid.js";
 import { TASK_RESULT_SCHEMA_TYPE, TASK_SCHEMA_VERSION } from "#src/utilities/validation.js";
+
+function computeTaskRequestHash({ title, description, parent_id, priority, execution }) {
+  const canonical = {
+    title,
+    description,
+    parent_id: parent_id ?? null,
+    priority,
+    execution: {
+      agent: execution.agent,
+      model: execution.model ?? null,
+      effort: execution.effort ?? null,
+      cwd: execution.cwd ?? null,
+      permission_mode: execution.permission_mode ?? null,
+      timeout_ms: execution.timeout_ms ?? null,
+      session_id: execution.session_id ?? null,
+      worktree: Boolean(execution.worktree),
+    },
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
 
 /**
  * Task business logic usecase.
@@ -13,6 +40,7 @@ export function createTaskUsecase({
   executeTask = null,
   workerConfig,
   allowedWorkspaces = [],
+  secrets = [],
   now = () => Date.now(),
   generateId = generateUuidV7,
   createTrace = createTraceContext,
@@ -85,6 +113,17 @@ export function createTaskUsecase({
       traceId: taskMeta.trace_id ?? null,
     });
     const createdAt = new Date(finishedAtMs).toISOString();
+    const safeOutputText =
+      typeof outputText === "string" ? redactSecrets(outputText, secrets) : outputText;
+    const safeError = error
+      ? {
+          ...error,
+          message:
+            typeof error.message === "string"
+              ? redactSecrets(error.message, secrets)
+              : error.message,
+        }
+      : null;
 
     return {
       schema: {
@@ -113,6 +152,7 @@ export function createTaskUsecase({
           permission_mode: execReq.permission_mode ?? workerConfig.default_permission_mode ?? null,
           enforcement: null,
           session_id: execReq.session_id ?? null,
+          worktree: null,
           exit_code: null,
           started_at: startedAtMs !== null ? new Date(startedAtMs).toISOString() : null,
           finished_at: createdAt,
@@ -120,7 +160,7 @@ export function createTaskUsecase({
         },
         output: {
           format: "markdown",
-          text: outputText,
+          text: safeOutputText,
         },
         usage: {
           input_tokens: null,
@@ -128,9 +168,52 @@ export function createTaskUsecase({
           total_cost_usd: null,
         },
         artifacts: null,
-        error,
+        error: safeError,
       },
     };
+  }
+
+  async function enforceSubtaskLimits(parentId) {
+    const maxDepth = workerConfig?.max_subtask_depth ?? 3;
+    const maxSubtasksPerRoot = workerConfig?.max_subtasks_per_root ?? 20;
+
+    let depth = 0;
+    let currentId = parentId;
+    let rootId = parentId;
+    const visited = new Set();
+
+    while (currentId) {
+      if (visited.has(currentId)) {
+        throw new ValidationError("Cycle detected in parent_id chain");
+      }
+      visited.add(currentId);
+      const ancestor = await taskRepository.findById(currentId);
+      if (!ancestor) {
+        if (depth === 0) {
+          throw new ValidationError(`Parent task not found: ${parentId}`);
+        }
+        break;
+      }
+      depth += 1;
+      rootId = ancestor.id;
+      if (depth > maxDepth) {
+        throw new ValidationError(
+          `Subtask depth ${depth} exceeds worker.max_subtask_depth (${maxDepth})`,
+        );
+      }
+      currentId = ancestor.parent_id ?? null;
+    }
+
+    if (typeof taskRepository.countDescendants === "function") {
+      const descendants = await taskRepository.countDescendants(rootId, {
+        maxDepth: maxDepth + 2,
+      });
+      if (descendants >= maxSubtasksPerRoot) {
+        throw new ValidationError(
+          `Root task ${rootId} reached worker.max_subtasks_per_root (${maxSubtasksPerRoot})`,
+        );
+      }
+    }
   }
 
   async function createTask({
@@ -139,10 +222,33 @@ export function createTaskUsecase({
     parent_id = null,
     priority,
     execution,
+    idempotency_key = null,
+    returnMeta = false,
+    skipSubtaskLimits = false,
     traceparent = null,
     trace_id = null,
     span_id = null,
   }) {
+    const requestHash = idempotency_key
+      ? computeTaskRequestHash({ title, description, parent_id, priority, execution })
+      : null;
+
+    if (idempotency_key && typeof taskRepository.findByIdempotencyKey === "function") {
+      const existing = await taskRepository.findByIdempotencyKey(idempotency_key);
+      if (existing) {
+        if (existing.request_hash === requestHash) {
+          return returnMeta ? { task: existing.record.task, replayed: true } : existing.record.task;
+        }
+        throw new ConflictError(
+          `Idempotency key "${idempotency_key}" already used with a different request payload`,
+        );
+      }
+    }
+
+    if (parent_id !== null && !skipSubtaskLimits) {
+      await enforceSubtaskLimits(parent_id);
+    }
+
     const nowMs = now();
     const isoTimestamp = new Date(nowMs).toISOString();
     const { trace_id: traceId, span_id: spanId } = createTrace({
@@ -171,13 +277,35 @@ export function createTaskUsecase({
       },
     };
 
-    const record = await taskRepository.create(taskMessage);
+    let record;
+    try {
+      record = await taskRepository.create(taskMessage, {
+        idempotencyKey: idempotency_key,
+        requestHash,
+      });
+    } catch (error) {
+      const isDuplicate =
+        idempotency_key &&
+        error instanceof StorageError &&
+        (error.statusCode === 409 || error.details?.code === "23505");
+      if (!isDuplicate || typeof taskRepository.findByIdempotencyKey !== "function") {
+        throw error;
+      }
+      const existing = await taskRepository.findByIdempotencyKey(idempotency_key);
+      if (existing && existing.request_hash === requestHash) {
+        return returnMeta ? { task: existing.record.task, replayed: true } : existing.record.task;
+      }
+      throw new ConflictError(
+        `Idempotency key "${idempotency_key}" already used with a different request payload`,
+      );
+    }
+
     logger.log(
       `[task] Enqueued task id=${taskMessage.data.id} agent=${execution.agent} priority=${priority} title=${JSON.stringify(title)} trace_id=${traceId} span_id=${spanId}`,
     );
     emitEvent("task.created", { record, task: taskMessage });
 
-    return taskMessage;
+    return returnMeta ? { task: taskMessage, replayed: false } : taskMessage;
   }
 
   async function getTask(id) {
@@ -203,6 +331,19 @@ export function createTaskUsecase({
       workerId: workerConfig.worker_id,
       allowedAgents: workerConfig.allowed_agents,
       allowedWorkspaces,
+    };
+  }
+
+  function getCapabilities() {
+    return {
+      allowed_agents: [...workerConfig.allowed_agents],
+      default_permission_mode: workerConfig.default_permission_mode,
+      max_permission_mode: workerConfig.max_permission_mode,
+      allowed_workspaces: [...allowedWorkspaces],
+      default_timeout_ms: workerConfig.default_timeout_ms,
+      max_subtask_depth: workerConfig.max_subtask_depth ?? 3,
+      max_subtasks_per_root: workerConfig.max_subtasks_per_root ?? 20,
+      worktree_supported: true,
     };
   }
 
@@ -262,6 +403,7 @@ export function createTaskUsecase({
           taskId,
           workerId: workerConfig.worker_id,
           leaseSeconds: workerConfig.lease_seconds,
+          attempt: claimed.attempts,
         })
         .then((extended) => {
           if (!extended && !signal?.aborted) {
@@ -367,6 +509,7 @@ export function createTaskUsecase({
       persisted = await taskRepository.finishTask({
         taskId,
         workerId: workerConfig.worker_id,
+        attempt: claimed.attempts,
         status: finalStatus,
         resultEnvelope,
         finishedAt: finishedAtIso,
@@ -490,6 +633,7 @@ export function createTaskUsecase({
       parent_id: record.id,
       priority: origData.priority ?? record.priority,
       execution: structuredClone(origData.execution ?? { agent: record.agent }),
+      skipSubtaskLimits: true,
       traceparent,
     });
   }
@@ -501,6 +645,7 @@ export function createTaskUsecase({
     cancelTask,
     retryTask,
     getStats,
+    getCapabilities,
     processNextTask,
     subscribe,
   };

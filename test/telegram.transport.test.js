@@ -297,6 +297,7 @@ test("Telegram transport enforces user_id + chat_id, handles Draft Card, worker 
     },
     logger: createMemoryLogger(),
   });
+  t.after(() => app.stop());
 
   // 1. Unauthorized chat_id or mismatched user_id is ignored
   mockTg.pushMessage({ chatId: 9999, userId: 2002, text: "Wrong chat" });

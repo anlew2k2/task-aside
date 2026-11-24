@@ -13,6 +13,8 @@ create table if not exists public.tasks (
   worker_id text null,
   attempts integer not null default 0,
   lease_expires_at timestamptz null,
+  idempotency_key text null,
+  request_hash text null,
   trace_id text null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -34,6 +36,10 @@ create index if not exists idx_tasks_parent_id
 
 create index if not exists idx_tasks_status_created
   on public.tasks (status, created_at desc);
+
+create unique index if not exists idx_tasks_idempotency_key
+  on public.tasks (idempotency_key)
+  where idempotency_key is not null;
 
 create or replace function public.claim_next_task(
   p_allowed_agents text[],
@@ -141,10 +147,14 @@ begin
 end;
 $$;
 
+drop function if exists public.extend_task_lease(uuid, text, integer);
+drop function if exists public.extend_task_lease(uuid, text, integer, integer);
+
 create or replace function public.extend_task_lease(
   p_task_id uuid,
   p_worker_id text,
-  p_lease_seconds integer default 120
+  p_lease_seconds integer default 120,
+  p_attempt integer default null
 )
 returns boolean
 language plpgsql
@@ -159,15 +169,41 @@ begin
     updated_at = v_now
   where id = p_task_id
     and status = 'running'
-    and worker_id = p_worker_id;
+    and worker_id = p_worker_id
+    and (p_attempt is null or attempts = p_attempt);
 
   return found;
 end;
 $$;
 
+create or replace function public.get_task_stats()
+returns jsonb
+language sql
+stable
+as $$
+  select jsonb_build_object(
+    'counts', jsonb_build_object(
+      'total', count(*)::bigint,
+      'queued', count(*) filter (where status = 'queued')::bigint,
+      'running', count(*) filter (where status = 'running')::bigint,
+      'completed', count(*) filter (where status = 'completed')::bigint,
+      'failed', count(*) filter (where status = 'failed')::bigint,
+      'timeout', count(*) filter (where status = 'timeout')::bigint,
+      'interrupted', count(*) filter (where status = 'interrupted')::bigint,
+      'cancelled', count(*) filter (where status = 'cancelled')::bigint
+    ),
+    'oldest_queued_at', to_char(
+      (min(created_at) filter (where status = 'queued')) at time zone 'UTC',
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )
+  )
+  from public.tasks;
+$$;
+
 alter table public.tasks disable row level security;
 grant select, insert, update, delete on public.tasks to anon, authenticated;
 grant execute on function public.claim_next_task(text[], text, integer) to anon, authenticated;
-grant execute on function public.extend_task_lease(uuid, text, integer) to anon, authenticated;
+grant execute on function public.extend_task_lease(uuid, text, integer, integer) to anon, authenticated;
+grant execute on function public.get_task_stats() to anon, authenticated;
 
 notify pgrst, 'reload schema';

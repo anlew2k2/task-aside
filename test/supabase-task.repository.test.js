@@ -88,8 +88,55 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
       res.end(JSON.stringify(true));
       return;
     }
-    if (req.url.startsWith("/rest/v1/tasks?select=status")) {
-      res.end(JSON.stringify([{ status: "queued" }, { status: "completed" }]));
+    if (req.url === "/rest/v1/rpc/get_task_stats") {
+      res.end(
+        JSON.stringify({
+          counts: {
+            total: 2,
+            queued: 1,
+            running: 0,
+            completed: 1,
+            failed: 0,
+            timeout: 0,
+            interrupted: 0,
+            cancelled: 0,
+          },
+          oldest_queued_at: "2026-11-24T10:00:00.000Z",
+        }),
+      );
+      return;
+    }
+    if (req.url.includes("idempotency_key=eq.")) {
+      res.end(
+        JSON.stringify([
+          {
+            ...baseRow,
+            idempotency_key: "key-1",
+            request_hash: "hash-1",
+          },
+        ]),
+      );
+      return;
+    }
+    if (req.url.includes("parent_id=in.")) {
+      res.end(JSON.stringify([]));
+      return;
+    }
+    if (req.url.includes("select=id%2Cparent_id")) {
+      res.end(
+        JSON.stringify([
+          {
+            id: baseRow.id,
+            parent_id: null,
+            priority: "P1",
+            agent: "codex",
+            status: "queued",
+            created_at: baseRow.created_at,
+            updated_at: baseRow.updated_at,
+            title: "Repo test",
+          },
+        ]),
+      );
       return;
     }
     if (req.method === "PATCH") {
@@ -120,6 +167,14 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
   const list = await repo.findAll({ status: "queued", agent: "codex", parent_id: null, limit: 10, offset: 5 });
   assert.equal(list.length, 1);
 
+  const summaryList = await repo.findAll({ summary: true });
+  assert.equal(summaryList.length, 1);
+  assert.equal(summaryList[0].title, "Repo test");
+  assert.equal("task" in summaryList[0], false);
+
+  const byKey = await repo.findByIdempotencyKey("key-1");
+  assert.equal(byKey.request_hash, "hash-1");
+
   const claimed = await repo.claimNext({
     allowedAgents: ["codex"],
     workerId: "w-1",
@@ -132,12 +187,14 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
     taskId: sampleEnvelope.data.id,
     workerId: "w-1",
     leaseSeconds: 90,
+    attempt: 1,
   });
   assert.equal(extended, true);
 
   const finished = await repo.finishTask({
     taskId: sampleEnvelope.data.id,
     workerId: "w-1",
+    attempt: 1,
     status: "completed",
     resultEnvelope: { schema: { version: "v1", type: "task_result" } },
     finishedAt: "2026-11-24T10:01:00.000Z",
@@ -156,6 +213,7 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
   assert.equal(stats.counts.total, 2);
   assert.equal(stats.counts.queued, 1);
   assert.equal(stats.counts.completed, 1);
+  assert.equal(typeof stats.oldest_queued_age_ms, "number");
 
   await repo.deleteById(sampleEnvelope.data.id);
 
@@ -166,15 +224,55 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
   assert.equal(requests[2].url.includes("parent_id=is.null"), true);
   assert.equal(requests[2].url.includes("status=eq.queued"), true);
   assert.equal(requests[2].url.includes("agent=eq.codex"), true);
+  const extendReq = requests.find((r) => r.url === "/rest/v1/rpc/extend_task_lease");
+  assert.equal(extendReq.body.p_attempt, 1);
   const finishReq = requests.find(
     (r) => r.method === "PATCH" && r.url.includes("status=eq.running"),
   );
   assert.ok(finishReq, "finishTask PATCH must filter status=eq.running");
+  assert.equal(finishReq.url.includes("attempts=eq.1"), true);
   const cancelReq = requests.find(
     (r) => r.method === "PATCH" && r.url.includes("status=in.%28queued%2Crunning%29"),
   );
   assert.ok(cancelReq, "cancelTask PATCH must filter status=in.(queued,running)");
   assert.equal(cancelReq.body.status, "cancelled");
+});
+
+test("Supabase task repository falls back to HEAD count=exact when get_task_stats RPC is missing", async (t) => {
+  const mock = await startMockSupabaseServer((req, res) => {
+    if (req.url === "/rest/v1/rpc/get_task_stats") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ code: "PGRST202", message: "Could not find the function" }));
+      return;
+    }
+    if (req.method === "HEAD") {
+      const url = new URL(req.url, "http://localhost");
+      const status = url.searchParams.get("status");
+      const count = status === "eq.queued" ? 2 : status === "eq.completed" ? 3 : 0;
+      res.writeHead(200, { "content-range": `*/${count}` });
+      res.end();
+      return;
+    }
+    if (req.url.includes("status=eq.queued") && req.url.includes("select=created_at")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify([{ created_at: new Date(Date.now() - 5000).toISOString() }]));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  t.after(() => mock.close());
+
+  const repo = createSupabaseTaskRepository({
+    url: mock.url,
+    publishableKey: "sb_publishable_test_key",
+  });
+
+  const stats = await repo.stats();
+  assert.equal(stats.counts.queued, 2);
+  assert.equal(stats.counts.completed, 3);
+  assert.equal(stats.counts.total, 5);
+  assert.ok(stats.oldest_queued_age_ms >= 4000);
 });
 
 test("Supabase task repository throws StorageError on error without leaking key", async (t) => {

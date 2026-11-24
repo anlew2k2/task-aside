@@ -1,4 +1,12 @@
-import { readFileSync } from "node:fs";
+import {
+  accessSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
 import { createHealthHandler } from "#src/handlers/health.handler.js";
 import { createTaskHandler } from "#src/handlers/task.handler.js";
 import { createSupabaseTaskRepository } from "#src/repositories/task.repository.js";
@@ -11,6 +19,7 @@ import { createTaskUsecase } from "#src/usecases/task.usecase.js";
 import { ConfigError } from "#src/utilities/errors.js";
 import { createFileLogger } from "#src/utilities/logger.js";
 import { getPackageInfo } from "#src/utilities/package-info.js";
+import { collectConfiguredSecrets, redactSecrets } from "#src/utilities/redaction.js";
 import { loadSettings, saveSettings, validateSettings } from "#src/utilities/settings.js";
 
 /**
@@ -99,11 +108,13 @@ export async function startApp({
     );
   }
 
+  const secrets = collectConfiguredSecrets(resolvedSettings);
+
   let resolvedLogger = logger;
   let ownsLogger = false;
   const logDir = resolvedSettings.logging.dir;
   if (!resolvedLogger) {
-    resolvedLogger = createFileLogger({ dir: logDir });
+    resolvedLogger = createFileLogger({ dir: logDir, secrets });
     ownsLogger = true;
   }
 
@@ -128,6 +139,7 @@ export async function startApp({
     createAgentService({
       workerConfig: resolvedSettings.worker,
       allowedWorkspaces: resolvedSettings.allowed_workspaces,
+      secrets,
       logger: resolvedLogger,
     });
 
@@ -137,6 +149,7 @@ export async function startApp({
     executeTask,
     workerConfig: resolvedSettings.worker,
     allowedWorkspaces: resolvedSettings.allowed_workspaces,
+    secrets,
     logger: resolvedLogger,
   });
 
@@ -146,6 +159,7 @@ export async function startApp({
   const workerTransport = createWorkerTransport({
     taskHandler,
     intervalMs: workerIntervalMs ?? resolvedSettings.worker.poll_interval_ms,
+    maxIntervalMs: resolvedSettings.worker.poll_max_interval_ms,
     logger: resolvedLogger,
   });
   const getWorkerStatus = () => workerTransport.status();
@@ -153,6 +167,7 @@ export async function startApp({
   const mcpTransport = resolvedEnableMcp
     ? createMcpTransport({
         taskHandler,
+        healthHandler,
         version: appInfo.version,
         logger: resolvedLogger,
       })
@@ -354,4 +369,439 @@ export async function authTelegram({
     ...result,
     settingsPath,
   };
+}
+
+/**
+ * Intake-only STDIO MCP server entrypoint (`task-aside mcp`).
+ * Keeps stdout strictly reserved for newline-delimited JSON-RPC responses.
+ */
+export async function startStdioMcp({
+  configPath = undefined,
+  settings = undefined,
+  taskRepository = null,
+  logger = undefined,
+  stdin = process.stdin,
+  stdout = process.stdout,
+  installSignalHandlers = true,
+} = {}) {
+  const appInfo = getPackageInfo();
+
+  let resolvedSettings;
+  let settingsPath = null;
+  if (settings !== undefined) {
+    resolvedSettings = validateSettings(settings, {
+      requireSupabase: !taskRepository,
+      requireTelegram: false,
+      requireAllowedWorkspaces: false,
+    });
+  } else {
+    const loaded = loadSettings({
+      configPath,
+      requireSupabase: !taskRepository,
+      requireTelegram: false,
+      requireAllowedWorkspaces: false,
+    });
+    resolvedSettings = loaded.settings;
+    settingsPath = loaded.path;
+  }
+
+  const secrets = collectConfiguredSecrets(resolvedSettings);
+  let resolvedLogger = logger;
+  let ownsLogger = false;
+  if (!resolvedLogger) {
+    resolvedLogger = createFileLogger({
+      dir: resolvedSettings.logging.dir,
+      consoleSink: null,
+      secrets,
+    });
+    ownsLogger = true;
+  }
+
+  const resolvedTaskRepository =
+    taskRepository ??
+    createSupabaseTaskRepository({
+      url: resolvedSettings.supabase.url,
+      publishableKey: resolvedSettings.supabase.publishable_key,
+      schema: resolvedSettings.supabase.schema,
+      table: resolvedSettings.supabase.table,
+    });
+
+  const taskUsecase = createTaskUsecase({
+    taskRepository: resolvedTaskRepository,
+    workerConfig: resolvedSettings.worker,
+    allowedWorkspaces: resolvedSettings.allowed_workspaces,
+    secrets,
+    logger: resolvedLogger,
+  });
+
+  const taskHandler = createTaskHandler({ taskUsecase });
+  const healthHandler = createHealthHandler({ taskUsecase, appInfo });
+  const mcpTransport = createMcpTransport({
+    taskHandler,
+    healthHandler,
+    version: appInfo.version,
+    logger: resolvedLogger,
+  });
+
+  const controller = new AbortController();
+  const stdio = mcpTransport.startStdio({
+    stdin,
+    stdout,
+    signal: controller.signal,
+  });
+
+  resolvedLogger.log(`${appInfo.name} v${appInfo.version} STDIO MCP ready`);
+
+  let stopped = false;
+  async function stop() {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    controller.abort();
+    await stdio.done;
+    if (ownsLogger) {
+      await resolvedLogger.close?.();
+    }
+  }
+
+  if (installSignalHandlers) {
+    const onSignal = () => {
+      void stop().then(
+        () => process.exit(0),
+        () => process.exit(1),
+      );
+    };
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
+  }
+
+  return {
+    settingsPath,
+    logDir: resolvedSettings.logging.dir,
+    done: stdio.done,
+    stop,
+  };
+}
+
+function defaultCheckExecutable(commandName) {
+  if (typeof commandName !== "string" || commandName.trim() === "") {
+    return { ok: false, path: null };
+  }
+  const trimmed = commandName.trim();
+  const isPath = trimmed.includes("/") || trimmed.includes("\\") || isAbsolute(trimmed);
+  const candidates = isPath
+    ? [trimmed]
+    : (process.env.PATH ?? "")
+        .split(delimiter)
+        .filter(Boolean)
+        .map((dir) => join(dir, trimmed));
+
+  for (const candidate of candidates) {
+    try {
+      if (!existsSync(candidate)) {
+        continue;
+      }
+      const st = statSync(candidate);
+      if (!st.isFile()) {
+        continue;
+      }
+      accessSync(candidate, fsConstants.X_OK);
+      return { ok: true, path: candidate };
+    } catch {
+      // Continue scanning candidates
+    }
+  }
+  return { ok: false, path: null };
+}
+
+/**
+ * Diagnostic check command (`task-aside doctor`) verifying settings, workspaces,
+ * writable directories, Supabase table/RPCs, and configured agent binaries.
+ */
+export async function runDoctor({
+  configPath = undefined,
+  settings = undefined,
+  fetchImpl = globalThis.fetch,
+  checkExecutable = defaultCheckExecutable,
+  logger = console,
+} = {}) {
+  const checks = [];
+  let resolvedSettings = null;
+  let settingsPath = null;
+  let secrets = [];
+
+  try {
+    if (settings !== undefined) {
+      resolvedSettings = validateSettings(settings, {
+        requireSupabase: true,
+        requireTelegram: undefined,
+        requireAllowedWorkspaces: true,
+      });
+      checks.push({
+        name: "settings",
+        status: "ok",
+        message: "In-memory settings valid",
+      });
+    } else {
+      const loaded = loadSettings({
+        configPath,
+        createIfMissing: false,
+        requireSupabase: true,
+        requireTelegram: undefined,
+        requireAllowedWorkspaces: true,
+      });
+      resolvedSettings = loaded.settings;
+      settingsPath = loaded.path;
+      let permWarn = false;
+      try {
+        const mode = statSync(settingsPath).mode & 0o077;
+        permWarn = mode !== 0;
+      } catch {
+        // Ignore on filesystems without POSIX mode bits
+      }
+      checks.push({
+        name: "settings",
+        status: permWarn ? "warn" : "ok",
+        message: permWarn
+          ? `Settings valid (${settingsPath}), but permissions are broader than 0600`
+          : `Settings valid (${settingsPath})`,
+      });
+    }
+    secrets = collectConfiguredSecrets(resolvedSettings);
+  } catch (error) {
+    checks.push({
+      name: "settings",
+      status: "fail",
+      message: redactSecrets(error instanceof Error ? error.message : String(error), secrets),
+    });
+    for (const check of checks) {
+      const prefix = check.status === "ok" ? "[OK]" : check.status === "warn" ? "[WARN]" : "[FAIL]";
+      (check.status === "fail" ? logger.error : logger.log)(`${prefix} ${check.name}: ${check.message}`);
+    }
+    return { ok: false, checks };
+  }
+
+  // Workspaces check
+  const missingWorkspaces = [];
+  for (const ws of resolvedSettings.allowed_workspaces) {
+    try {
+      if (!existsSync(ws) || !statSync(ws).isDirectory()) {
+        missingWorkspaces.push(ws);
+      }
+    } catch {
+      missingWorkspaces.push(ws);
+    }
+  }
+  checks.push(
+    missingWorkspaces.length === 0
+      ? {
+          name: "workspaces",
+          status: "ok",
+          message: `Verified ${resolvedSettings.allowed_workspaces.length} workspace path(s)`,
+        }
+      : {
+          name: "workspaces",
+          status: "fail",
+          message: `Missing or non-directory allowed_workspaces: ${missingWorkspaces.join(", ")}`,
+        },
+  );
+
+  // Writable directories check
+  const dirFailures = [];
+  for (const [label, dirPath] of [
+    ["logging.dir", resolvedSettings.logging.dir],
+    ["worker.runs_dir", resolvedSettings.worker.runs_dir],
+  ]) {
+    try {
+      mkdirSync(dirPath, { recursive: true });
+      accessSync(dirPath, fsConstants.W_OK);
+    } catch (error) {
+      dirFailures.push(`${label} (${dirPath}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  checks.push(
+    dirFailures.length === 0
+      ? {
+          name: "directories",
+          status: "ok",
+          message: `Writable logs (${resolvedSettings.logging.dir}) and runs (${resolvedSettings.worker.runs_dir})`,
+        }
+      : {
+          name: "directories",
+          status: "fail",
+          message: dirFailures.join("; "),
+        },
+  );
+
+  // Supabase connectivity & RPC / migration check
+  const { url, publishable_key: publishableKey, schema, table } = resolvedSettings.supabase;
+  const baseUrl = url.replace(/\/+$/, "");
+  const encodedTable = encodeURIComponent(table);
+  const baseHeaders = {
+    apikey: publishableKey,
+    authorization: `Bearer ${publishableKey}`,
+    "content-type": "application/json",
+    ...(schema !== "public"
+      ? {
+          "Accept-Profile": schema,
+          "Content-Profile": schema,
+        }
+      : {}),
+  };
+
+  try {
+    const tableRes = await fetchImpl(`${baseUrl}/rest/v1/${encodedTable}?select=id&limit=1`, {
+      method: "GET",
+      headers: baseHeaders,
+    });
+    if (!tableRes.ok) {
+      checks.push({
+        name: "supabase",
+        status: "fail",
+        message: redactSecrets(
+          `Supabase table "${schema}.${table}" check failed with HTTP ${tableRes.status}`,
+          secrets,
+        ),
+      });
+    } else {
+      let openApiPaths = null;
+      let openApiDefs = null;
+      try {
+        const schemaRes = await fetchImpl(`${baseUrl}/rest/v1/`, {
+          method: "GET",
+          headers: baseHeaders,
+        });
+        if (schemaRes.ok) {
+          const spec = await schemaRes.json();
+          if (spec && typeof spec === "object" && spec.paths) {
+            openApiPaths = spec.paths;
+            openApiDefs = spec.definitions ?? null;
+          }
+        }
+      } catch {
+        // Fallback to direct probes below
+      }
+
+      const missingRequired = [];
+      const missingUpgrades = [];
+
+      if (openApiPaths) {
+        if (!("/rpc/claim_next_task" in openApiPaths)) {
+          missingRequired.push("rpc/claim_next_task");
+        }
+        if (!("/rpc/extend_task_lease" in openApiPaths)) {
+          missingRequired.push("rpc/extend_task_lease");
+        }
+        if (!("/rpc/get_task_stats" in openApiPaths)) {
+          missingUpgrades.push("rpc/get_task_stats");
+        }
+        const tableProps = openApiDefs?.[table]?.properties;
+        if (tableProps && !("idempotency_key" in tableProps)) {
+          missingUpgrades.push("idempotency_key column");
+        }
+      } else {
+        const extendRes = await fetchImpl(`${baseUrl}/rest/v1/rpc/extend_task_lease`, {
+          method: "POST",
+          headers: baseHeaders,
+          body: JSON.stringify({
+            p_task_id: "00000000-0000-0000-0000-000000000000",
+            p_worker_id: "__doctor__",
+            p_lease_seconds: 10,
+            p_attempt: 1,
+          }),
+        });
+        if (extendRes.status === 404) {
+          missingRequired.push("rpc/extend_task_lease");
+        }
+        const statsRes = await fetchImpl(`${baseUrl}/rest/v1/rpc/get_task_stats`, {
+          method: "POST",
+          headers: baseHeaders,
+          body: JSON.stringify({}),
+        });
+        if (statsRes.status === 404) {
+          missingUpgrades.push("rpc/get_task_stats");
+        }
+        const idemRes = await fetchImpl(
+          `${baseUrl}/rest/v1/${encodedTable}?select=idempotency_key&limit=1`,
+          { method: "GET", headers: baseHeaders },
+        );
+        if (!idemRes.ok) {
+          missingUpgrades.push("idempotency_key column");
+        }
+      }
+
+      if (missingRequired.length > 0) {
+        checks.push({
+          name: "supabase",
+          status: "fail",
+          message: `Missing required Supabase RPC(s): ${missingRequired.join(", ")} (apply migrations/000001-init-schema.sql)`,
+        });
+      } else if (missingUpgrades.length > 0) {
+        checks.push({
+          name: "supabase",
+          status: "warn",
+          message: `Connected, but optional upgrade feature(s) missing: ${missingUpgrades.join(", ")} (re-apply migrations/000001-init-schema.sql)`,
+        });
+      } else {
+        checks.push({
+          name: "supabase",
+          status: "ok",
+          message: `Connected to ${schema}.${table}; schema and RPCs ready`,
+        });
+      }
+    }
+  } catch (error) {
+    checks.push({
+      name: "supabase",
+      status: "fail",
+      message: redactSecrets(
+        `Supabase connection error: ${error instanceof Error ? error.message : String(error)}`,
+        secrets,
+      ),
+    });
+  }
+
+  // Agent CLI executables check
+  const missingAgents = [];
+  const foundAgents = [];
+  for (const agentName of resolvedSettings.worker.allowed_agents) {
+    const execName = resolvedSettings.worker.agents[agentName]?.executable ?? agentName;
+    const probe = checkExecutable(execName);
+    if (probe?.ok) {
+      foundAgents.push(`${agentName}(${probe.path ?? execName})`);
+    } else {
+      missingAgents.push(`${agentName}(${execName})`);
+    }
+  }
+  checks.push(
+    missingAgents.length === 0
+      ? {
+          name: "agents",
+          status: "ok",
+          message: `Found allowed agent binaries: ${foundAgents.join(", ")}`,
+        }
+      : {
+          name: "agents",
+          status: "fail",
+          message: `Missing executable(s) for allowed_agents: ${missingAgents.join(", ")}`,
+        },
+  );
+
+  if (resolvedSettings.transports.telegram) {
+    checks.push({
+      name: "telegram",
+      status: "ok",
+      message: `Telegram configured for chat_id=${resolvedSettings.telegram.chat_id}`,
+    });
+  }
+
+  const ok = checks.every((check) => check.status !== "fail");
+  for (const check of checks) {
+    const prefix = check.status === "ok" ? "[OK]" : check.status === "warn" ? "[WARN]" : "[FAIL]";
+    const line = redactSecrets(`${prefix} ${check.name}: ${check.message}`, secrets);
+    (check.status === "fail" ? logger.error : logger.log)(line);
+  }
+
+  return { ok, checks };
 }

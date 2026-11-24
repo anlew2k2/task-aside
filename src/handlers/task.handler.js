@@ -2,6 +2,8 @@ import {
   assertNonEmptyString,
   assertNullableUuidV7,
   assertOptionalAgentName,
+  assertOptionalBoolean,
+  assertOptionalIdempotencyKey,
   assertOptionalTaskStatus,
   assertPaginationInt,
   assertPlainObject,
@@ -22,7 +24,9 @@ export function createTaskHandler({ taskUsecase }) {
     const parent_id = assertNullableUuidV7(args.parent_id, "parent_id");
     const priority = assertTaskPriority(args.priority, "priority");
     const execution = assertTaskExecution(args.execution, "execution");
+    const idempotency_key = assertOptionalIdempotencyKey(args.idempotency_key, "idempotency_key");
     const traceparent = typeof context?.traceparent === "string" ? context.traceparent : null;
+    const returnMeta = Boolean(context?.returnMeta);
 
     return taskUsecase.createTask({
       title,
@@ -30,6 +34,8 @@ export function createTaskHandler({ taskUsecase }) {
       parent_id,
       priority,
       execution,
+      idempotency_key,
+      returnMeta,
       traceparent,
     });
   }
@@ -48,6 +54,7 @@ export function createTaskHandler({ taskUsecase }) {
       args.parent_id === undefined
         ? undefined
         : assertNullableUuidV7(args.parent_id, "parent_id");
+    const summary = assertOptionalBoolean(args.summary, "summary", false);
     const limit = assertPaginationInt(args.limit, "limit", {
       min: 1,
       max: 200,
@@ -65,6 +72,7 @@ export function createTaskHandler({ taskUsecase }) {
       parent_id,
       limit,
       offset,
+      summary,
     });
   }
 

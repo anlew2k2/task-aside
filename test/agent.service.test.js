@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -389,4 +390,169 @@ test("createAgentService handles policy rejections, subdirectories, symlinks, no
   );
   assert.equal(aborted.status, "interrupted");
   assert.equal(aborted.resultEnvelope.data.error.code, "ABORTED");
+});
+
+test("createAgentService redacts secrets across logs, raw output, and result_envelope", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-agent-redact-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const repoDir = join(dir, "repo");
+  const runsDir = join(dir, "runs");
+  mkdirSync(repoDir, { recursive: true });
+
+  const leakyCli = makeFakeCli(
+    dir,
+    "leaky-cli.mjs",
+    `
+    process.stderr.write("Authorization: Bearer secret_token_1234567890\\n");
+    process.stdout.write(JSON.stringify({
+      type: "result",
+      is_error: false,
+      result: "Done with sk-proj-abcdefghijklmnopqrstuvwxyz123456 and my_secret_bot_token",
+      session_id: "sess-redact"
+    }));
+    `,
+  );
+
+  const service = createAgentService({
+    workerConfig: {
+      worker_id: "test-worker",
+      runs_dir: runsDir,
+      allowed_agents: ["claude"],
+      default_permission_mode: "workspace",
+      max_permission_mode: "workspace",
+      default_timeout_ms: 5_000,
+      agents: {
+        agy: { executable: "agy", default_model: null, default_effort: null },
+        claude: { executable: leakyCli, default_model: null, default_effort: null },
+        codex: { executable: "codex", default_model: null, default_effort: null, skip_git_repo_check: false },
+      },
+    },
+    allowedWorkspaces: [repoDir],
+    secrets: ["my_secret_bot_token"],
+    logger: { log() {}, error() {} },
+  });
+
+  const res = await service.executeTask(
+    makeTaskEnvelope({ title: "Redact test", execution: { agent: "claude" } }),
+  );
+  assert.equal(res.status, "completed");
+  assert.equal(res.resultEnvelope.data.output.text.includes("sk-proj-"), false);
+  assert.equal(res.resultEnvelope.data.output.text.includes("my_secret_bot_token"), false);
+  assert.ok(res.resultEnvelope.data.output.text.includes("[REDACTED]"));
+
+  const rawText = readFileSync(res.resultEnvelope.data.artifacts.raw_output_file, "utf8");
+  const logText = readFileSync(res.resultEnvelope.data.artifacts.log_file, "utf8");
+  const resultJson = readFileSync(res.resultEnvelope.data.artifacts.result_file, "utf8");
+  assert.equal(rawText.includes("my_secret_bot_token"), false);
+  assert.equal(logText.includes("secret_token_1234567890"), false);
+  assert.equal(resultJson.includes("sk-proj-abcdefghijklmnopqrstuvwxyz123456"), false);
+});
+
+test("createAgentService isolates execution with execution.worktree and performs smart cleanup", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-agent-worktree-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const repoDir = join(dir, "repo");
+  const nonGitDir = join(dir, "plain-dir");
+  const runsDir = join(dir, "runs");
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(nonGitDir, { recursive: true });
+
+  execFileSync("git", ["init"], { cwd: repoDir });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: repoDir });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+  writeFileSync(join(repoDir, "README.md"), "hello\n", "utf8");
+  execFileSync("git", ["add", "README.md"], { cwd: repoDir });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir });
+
+  // Fake CLI switches mode based on task title embedded in stdin prompt
+  const worktreeCli = makeFakeCli(
+    dir,
+    "worktree-cli.mjs",
+    `
+    import { writeFileSync } from "node:fs";
+    import { execFileSync } from "node:child_process";
+    let stdin = "";
+    process.stdin.on("data", (d) => { stdin += d; });
+    process.stdin.on("end", () => {
+      if (stdin.includes("uncommitted")) {
+        writeFileSync("README.md", "dirty change\\n", "utf8");
+      } else if (stdin.includes("committed")) {
+        writeFileSync("README.md", "committed change\\n", "utf8");
+        execFileSync("git", ["add", "README.md"]);
+        execFileSync("git", ["commit", "-m", "agent commit"]);
+      }
+      process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "ok" }));
+    });
+    `,
+  );
+
+  const service = createAgentService({
+    workerConfig: {
+      worker_id: "test-worker",
+      runs_dir: runsDir,
+      allowed_agents: ["claude"],
+      default_permission_mode: "workspace",
+      max_permission_mode: "workspace",
+      default_timeout_ms: 10_000,
+      agents: {
+        agy: { executable: "agy", default_model: null, default_effort: null },
+        claude: { executable: worktreeCli, default_model: null, default_effort: null },
+        codex: { executable: "codex", default_model: null, default_effort: null, skip_git_repo_check: false },
+      },
+    },
+    allowedWorkspaces: [dir],
+    logger: { log() {}, error() {} },
+  });
+
+  // 1. Non-git directory fails pre-spawn with INVALID_WORKTREE
+  const nonGitRes = await service.executeTask(
+    makeTaskEnvelope({ title: "Non git", execution: { agent: "claude", cwd: nonGitDir, worktree: true } }),
+  );
+  assert.equal(nonGitRes.status, "failed");
+  assert.equal(nonGitRes.resultEnvelope.data.error.code, "INVALID_WORKTREE");
+
+  // 2. Uncommitted change keeps worktree & branch
+  const dirtyRes = await service.executeTask(
+    makeTaskEnvelope({ title: "uncommitted edit", execution: { agent: "claude", cwd: repoDir, worktree: true } }),
+  );
+  assert.equal(dirtyRes.status, "completed");
+  const dirtyWt = dirtyRes.resultEnvelope.data.execution.worktree;
+  assert.equal(dirtyWt.enabled, true);
+  assert.equal(dirtyWt.has_uncommitted_changes, true);
+  assert.equal(dirtyWt.cleaned_up, false);
+  assert.equal(dirtyWt.branch_kept, true);
+  assert.equal(existsSync(dirtyWt.path), true);
+  assert.deepEqual(dirtyWt.changed_files, ["README.md"]);
+  assert.equal(readFileSync(join(repoDir, "README.md"), "utf8"), "hello\n");
+
+  // 3. Committed change removes worktree directory but preserves branch
+  const commitRes = await service.executeTask(
+    makeTaskEnvelope({ title: "committed edit", execution: { agent: "claude", cwd: repoDir, worktree: true } }),
+  );
+  assert.equal(commitRes.status, "completed");
+  const commitWt = commitRes.resultEnvelope.data.execution.worktree;
+  assert.equal(commitWt.has_uncommitted_changes, false);
+  assert.equal(commitWt.commits_ahead, 1);
+  assert.equal(commitWt.cleaned_up, true);
+  assert.equal(commitWt.branch_kept, true);
+  assert.equal(commitWt.path, null);
+  assert.ok(commitWt.diff_stat.includes("README.md"));
+
+  // 4. Zero changes removes worktree and deletes branch
+  const cleanRes = await service.executeTask(
+    makeTaskEnvelope({ title: "noop task", execution: { agent: "claude", cwd: repoDir, worktree: true } }),
+  );
+  assert.equal(cleanRes.status, "completed");
+  const cleanWt = cleanRes.resultEnvelope.data.execution.worktree;
+  assert.equal(cleanWt.has_uncommitted_changes, false);
+  assert.equal(cleanWt.commits_ahead, 0);
+  assert.equal(cleanWt.cleaned_up, true);
+  assert.equal(cleanWt.branch_kept, false);
+  const branchList = execFileSync("git", ["branch", "--list", cleanWt.branch], {
+    cwd: repoDir,
+    encoding: "utf8",
+  });
+  assert.equal(branchList.trim(), "");
 });

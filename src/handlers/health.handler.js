@@ -16,7 +16,12 @@ export function createHealthHandler({ taskUsecase, appInfo }) {
     };
   }
 
+  function getCapabilities() {
+    return taskUsecase.getCapabilities();
+  }
+
   return {
     getHealth,
+    getCapabilities,
   };
 }

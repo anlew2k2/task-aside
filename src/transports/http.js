@@ -60,10 +60,39 @@ export function createHttpTransport({
     }
 
     try {
+      const headerKeyRaw = req.headers["idempotency-key"];
+      const headerKey =
+        typeof headerKeyRaw === "string" && headerKeyRaw.trim() !== ""
+          ? headerKeyRaw.trim()
+          : null;
+
+      let payload = body;
+      if (body && typeof body === "object" && !Array.isArray(body)) {
+        const bodyKey =
+          typeof body.idempotency_key === "string" && body.idempotency_key.trim() !== ""
+            ? body.idempotency_key.trim()
+            : null;
+        if (headerKey && bodyKey && headerKey !== bodyKey) {
+          throw new ValidationError(
+            "Idempotency-Key header does not match idempotency_key in request body",
+          );
+        }
+        if (headerKey && body.idempotency_key === undefined) {
+          payload = { ...body, idempotency_key: headerKey };
+        }
+      }
+
       const traceparent =
         typeof req.headers.traceparent === "string" ? req.headers.traceparent : null;
-      const task = await taskHandler.createTask(body, { traceparent });
-      sendJson(res, 201, task);
+      const { task, replayed } = await taskHandler.createTask(payload, {
+        traceparent,
+        returnMeta: true,
+      });
+      if (replayed) {
+        sendJson(res, 200, task, { "x-idempotent-replay": "true" });
+      } else {
+        sendJson(res, 201, task);
+      }
     } catch (error) {
       if (!handleTaskError(res, error)) {
         throw error;
@@ -88,6 +117,7 @@ export function createHttpTransport({
         parent_id,
         limit: params.get("limit") ?? undefined,
         offset: params.get("offset") ?? undefined,
+        summary: params.get("summary") === "true",
       });
       sendJson(res, 200, result);
     } catch (error) {

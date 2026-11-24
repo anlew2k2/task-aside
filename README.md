@@ -23,7 +23,8 @@ Key groups in `~/.task-aside/settings.json`:
 - `logging`: `{ "dir": "~/.task-aside/logs" }`
 - `worker`:
   - `worker_id`: Optional worker identifier (`null` defaults to `<hostname>-<pid>`)
-  - `poll_interval_ms`: Sequential polling interval (default: `1000`)
+  - `poll_interval_ms`: Minimum sequential polling interval (default: `1000`)
+  - `poll_max_interval_ms`: Maximum adaptive backoff polling interval when idle (default: `30000`)
   - `lease_seconds`: Task claim lease duration in seconds (default: `120`)
   - `heartbeat_interval_ms`: Lease extension interval in ms (default: `30000`)
   - `runs_dir`: Per-run artifact directory (default: `"~/.task-aside/runs"`)
@@ -31,11 +32,13 @@ Key groups in `~/.task-aside/settings.json`:
   - `default_permission_mode`: Default permission policy (`"read-only" | "workspace" | "full"`, default: `"workspace"`)
   - `max_permission_mode`: Maximum permission policy ceiling allowed by this worker (default: `"workspace"`)
   - `default_timeout_ms`: Default execution timeout in ms (default: `600000`)
+  - `max_subtask_depth`: Maximum `parent_id` nesting depth for new subtasks (default: `3`)
+  - `max_subtasks_per_root`: Maximum total descendants per root task (default: `20`)
   - `agents`: Per-agent CLI overrides (`agy`, `claude`, `codex` executables, `default_model`/`default_effort` defaulting to `null` to defer to each CLI harness's own defaults, and `codex.skip_git_repo_check`)
 
 ## Supabase Schema
 
-Apply `migrations/schema.sql` to your Supabase Postgres database before running. It provisions `public.tasks` and the `claim_next_task` / `extend_task_lease` RPC functions. For existing databases created before `cancelled` support, also apply `migrations/20261124_add_cancelled_status.sql`.
+Apply `migrations/000001-init-schema.sql` to your Supabase Postgres database before running. It provisions `public.tasks`, `idempotency_key` deduplication, and the `claim_next_task`, attempt-fenced `extend_task_lease`, and `get_task_stats` RPC functions.
 
 ## Run
 
@@ -53,6 +56,8 @@ node ./bin/task-aside.js
 
 ## Options & Commands
 
+- `task-aside mcp [-c <path>]` — Start intake-only STDIO MCP transport (JSON-RPC over stdin/stdout; logs go to files only)
+- `task-aside doctor [-c <path>]` — Verify `settings.json`, workspaces, writable directories, Supabase RPCs, and agent binaries
 - `task-aside auth telegram [-c <path>]` — Pair your Telegram `user_id` and `chat_id` using a 5-minute `/auth <token>` handshake and enable `transports.telegram`
 - `-c, --config <path>` — Path to `settings.json` (default: `~/.task-aside/settings.json`)
 - `-p, --port <port>` — HTTP/MCP port (overrides `settings.json` `server.port`)
@@ -88,11 +93,14 @@ Both HTTP (`POST /tasks`) and MCP (`create_task`) validate input, persist the `v
       "cwd": null,
       "permission_mode": "workspace",
       "timeout_ms": null,
-      "session_id": null
+      "session_id": null,
+      "worktree": false
     }
   }
 }
 ```
+
+> Both HTTP (`POST /tasks`, via body `idempotency_key` or `Idempotency-Key` header) and MCP (`create_task`) support optional `idempotency_key` deduplication (`200` replay on identical payload, `409` on mismatch). Setting `execution.worktree: true` isolates execution inside a temporary `git worktree` under `~/.task-aside/runs/<id>/worktree`.
 
 ## Task Result Envelope (`v1` / `task_result`)
 
@@ -169,11 +177,12 @@ curl -s -X POST http://127.0.0.1:3100/tasks/<uuid-v7>/retry
 
 Built-in MCP tools:
 
-- `create_task` — create a task (`title`, `description`, `priority`, `execution`, optional `parent_id`)
-- `get_task` — fetch a task and its `result` envelope by `id`
-- `list_tasks` — list tasks with optional `status`, `agent`, `parent_id`, `limit`, `offset` filters
+- `create_task` — create a task (`title`, `description`, `priority`, `execution`, optional `parent_id`, `idempotency_key`, `execution.worktree`); returns `poll_after_ms`
+- `get_task` — fetch a task by `id`; truncates `result.data.output.text` at 6000 chars unless `full_output: true`, includes `poll_after_ms` while active, and flags `untrusted_output: true`
+- `list_tasks` — list compact task summaries (`id`, `title`, `status`, `priority`, `agent`, `parent_id`, timestamps) with optional `status`, `agent`, `parent_id`, `limit`, `offset` filters
 - `cancel_task` — cancel a `queued` or `running` task by `id`
 - `retry_task` — enqueue a new task linked via `parent_id` from a terminal task by `id`
+- `get_capabilities` — inspect allowed agents, permission ceiling, `allowed_workspaces`, subtask limits, and worktree support
 
 Telegram commands (when `transports.telegram` is enabled):
 
