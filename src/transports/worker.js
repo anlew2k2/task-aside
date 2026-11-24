@@ -1,7 +1,11 @@
 /**
- * Background worker transport polling through the task handler.
+ * Background worker transport polling sequentially through the task handler.
  */
-export function createWorkerTransport({ taskHandler, intervalMs = 100 }) {
+export function createWorkerTransport({
+  taskHandler,
+  intervalMs = 1_000,
+  logger = console,
+}) {
   let running = false;
   let busy = false;
   let timer = null;
@@ -26,6 +30,15 @@ export function createWorkerTransport({ taskHandler, intervalMs = 100 }) {
             if (!outcome.processed) {
               break;
             }
+          } catch (error) {
+            if (error?.name === "AbortError" || !running) {
+              break;
+            }
+            logger.error(
+              "[worker] Polling error:",
+              error instanceof Error ? error.message : String(error),
+            );
+            break;
           } finally {
             activeController = null;
           }

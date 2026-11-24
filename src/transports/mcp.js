@@ -1,49 +1,33 @@
-import { NotFoundError, ValidationError } from "../utilities/errors.js";
-import { isPlainObject } from "../utilities/validation.js";
-
-const MAX_BODY_BYTES = 1_048_576;
+import { QueueError, ValidationError } from "../utilities/errors.js";
+import { readJsonBody, sendEmpty, sendJson } from "../utilities/http.js";
+import { isPlainObject, TASK_PRIORITIES } from "../utilities/validation.js";
 
 const TOOLS = [
   {
-    name: "enqueue_task",
-    description: "Enqueue a task for the background worker to process.",
+    name: "create_task",
+    description: "Create a task and enqueue it to Cloudflare Queue.",
     inputSchema: {
       type: "object",
       properties: {
-        name: {
+        title: {
           type: "string",
-          description: "Name of the background task",
+          description: "Task title",
         },
-        payload: {
-          type: "object",
-          description: "Optional JSON payload for the task",
+        description: {
+          type: "string",
+          description: "Task description in Markdown format",
+        },
+        parent_id: {
+          type: ["string", "null"],
+          description: "Optional parent task UUID v7 or null",
+        },
+        priority: {
+          type: "string",
+          enum: TASK_PRIORITIES,
+          description: "Task priority level",
         },
       },
-      required: ["name"],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "get_task",
-    description: "Get the current status and result of a background task by ID.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        id: {
-          type: "string",
-          description: "Task ID returned by enqueue_task",
-        },
-      },
-      required: ["id"],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "list_tasks",
-    description: "List all background tasks and current worker status.",
-    inputSchema: {
-      type: "object",
-      properties: {},
+      required: ["title", "description", "priority"],
       additionalProperties: false,
     },
   },
@@ -59,70 +43,6 @@ function jsonRpcError(id, code, message, data) {
     error.data = data;
   }
   return { jsonrpc: "2.0", id, error };
-}
-
-function sendJson(res, statusCode, payload, extraHeaders = {}) {
-  const body = JSON.stringify(payload);
-  res.writeHead(statusCode, {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(body),
-    ...extraHeaders,
-  });
-  res.end(body);
-}
-
-function sendEmpty(res, statusCode, extraHeaders = {}) {
-  res.writeHead(statusCode, extraHeaders);
-  res.end();
-}
-
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalBytes = 0;
-    let settled = false;
-
-    req.on("data", (chunk) => {
-      if (settled) {
-        return;
-      }
-
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_BODY_BYTES) {
-        settled = true;
-        const err = new Error("Request body too large");
-        err.statusCode = 413;
-        req.destroy();
-        reject(err);
-        return;
-      }
-
-      chunks.push(chunk);
-    });
-
-    req.on("end", () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      const raw = Buffer.concat(chunks).toString("utf8");
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        const err = new Error("Parse error");
-        err.statusCode = 400;
-        reject(err);
-      }
-    });
-
-    req.on("error", (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      reject(error);
-    });
-  });
 }
 
 function formatToolResponse(data, isError = false) {
@@ -149,37 +69,22 @@ export function createMcpTransport({
   taskHandler,
   version,
   protocolVersion = "2025-03-26",
-  getWorkerStatus,
+  logger = console,
 }) {
   async function callTool(name, args) {
     const input = args === undefined ? {} : args;
 
     switch (name) {
-      case "enqueue_task": {
-        const task = await taskHandler.enqueueTask(input);
-        return formatToolResponse(task);
-      }
-
-      case "get_task": {
+      case "create_task": {
         try {
-          const task = await taskHandler.getTask(input);
+          const task = await taskHandler.createTask(input);
           return formatToolResponse(task);
         } catch (error) {
-          if (error instanceof NotFoundError) {
-            return formatToolResponse({ error: error.message }, true);
+          if (error instanceof QueueError) {
+            return formatToolResponse({ error: error.message, code: error.code }, true);
           }
           throw error;
         }
-      }
-
-      case "list_tasks": {
-        if (!isPlainObject(input)) {
-          throw new ValidationError("Tool arguments must be an object");
-        }
-        const summary = await taskHandler.listTasks({
-          worker: getWorkerStatus?.(),
-        });
-        return formatToolResponse(summary);
       }
 
       default:
@@ -226,6 +131,7 @@ export function createMcpTransport({
         if (!isPlainObject(params) || typeof params.name !== "string") {
           return jsonRpcError(id, -32602, 'Invalid params: "name" is required');
         }
+        logger.log(`[mcp] tools/call name=${params.name}`);
         try {
           const result = await callTool(params.name, params.arguments);
           return jsonRpcResult(id, result);
@@ -286,6 +192,10 @@ export function createMcpTransport({
   function handleHttpRequest(req, res) {
     if (req.method === "POST") {
       void handlePost(req, res).catch((error) => {
+        logger.error(
+          "[mcp] Unhandled error:",
+          error instanceof Error ? error.message : String(error),
+        );
         if (!res.headersSent) {
           sendJson(res, 500, jsonRpcError(null, -32603, error.message));
         }

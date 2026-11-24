@@ -1,5 +1,9 @@
 function cloneTask(task) {
-  return task ? { ...task } : null;
+  return task ? structuredClone(task) : null;
+}
+
+function resolveTaskId(task) {
+  return task?.data?.id ?? task?.id;
 }
 
 /**
@@ -11,7 +15,7 @@ export function createTaskRepository() {
 
   async function create(task) {
     const record = cloneTask(task);
-    tasks.set(record.id, record);
+    tasks.set(resolveTaskId(record), record);
     return cloneTask(record);
   }
 

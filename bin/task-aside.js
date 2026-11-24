@@ -2,6 +2,7 @@
 
 import { parseArgs } from "node:util";
 import { startApp } from "../src/index.js";
+import { loadEnvFile } from "../src/utilities/env.js";
 import { getPackageInfo } from "../src/utilities/package-info.js";
 
 const { name, version } = getPackageInfo();
@@ -25,8 +26,8 @@ function parseCliArgs(argv) {
     ({ values } = parseArgs({
       args: argv,
       options: {
-        port: { type: "string", short: "p", default: process.env.PORT ?? "3100" },
-        host: { type: "string", short: "H", default: process.env.HOST ?? "127.0.0.1" },
+        port: { type: "string", short: "p" },
+        host: { type: "string", short: "H" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -48,22 +49,31 @@ function parseCliArgs(argv) {
     process.exit(0);
   }
 
-  if (!/^\d+$/.test(values.port)) {
-    console.error(`Invalid port "${values.port}": expected an integer between 0 and 65535.`);
-    process.exit(1);
+  let port;
+  if (values.port !== undefined) {
+    const rawPort = values.port.trim();
+    if (!/^\d+$/.test(rawPort)) {
+      console.error(`Invalid port "${values.port}": expected an integer between 0 and 65535.`);
+      process.exit(1);
+    }
+
+    port = Number.parseInt(rawPort, 10);
+    if (port < 0 || port > 65535) {
+      console.error(`Invalid port "${values.port}": expected an integer between 0 and 65535.`);
+      process.exit(1);
+    }
   }
 
-  const port = Number.parseInt(values.port, 10);
-  if (port < 0 || port > 65535) {
-    console.error(`Invalid port "${values.port}": expected an integer between 0 and 65535.`);
-    process.exit(1);
-  }
+  const trimmedHost = values.host?.trim();
+  const host = trimmedHost ? trimmedHost : undefined;
 
   return {
-    host: values.host,
+    host,
     port,
   };
 }
+
+loadEnvFile();
 
 const config = parseCliArgs(process.argv.slice(2));
 

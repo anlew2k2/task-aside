@@ -1,121 +1,156 @@
-import { randomUUID } from "node:crypto";
-import { NotFoundError } from "../utilities/errors.js";
+import { generateUuidV7 } from "../utilities/uuid.js";
+import { TASK_SCHEMA_VERSION } from "../utilities/validation.js";
 
-async function defaultExecuteTask(task, _signal) {
-  return {
-    message: "Processed by background worker",
-    name: task.name,
-    payload: task.payload ?? null,
+function createAbortError() {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+export function sleep(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(createAbortError());
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(createAbortError());
+    };
+
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export function createMockTaskExecutor({ delayMs = 5_000, logger = console } = {}) {
+  return async function mockExecuteTask(taskMessage, { signal } = {}) {
+    await sleep(delayMs, signal);
+    const id = taskMessage?.data?.id ?? null;
+    const title = taskMessage?.data?.title ?? "";
+    const priority = taskMessage?.data?.priority ?? "";
+    logger.log(
+      `[worker] Processed task id=${id} priority=${priority} title=${JSON.stringify(title)}`,
+      taskMessage,
+    );
+    return {
+      status: "completed",
+      taskId: id,
+    };
   };
 }
 
 /**
  * Task business logic usecase.
- * Orchestrates task persistence (repository) and queue dispatch (service).
+ * Orchestrates task envelope creation, Cloudflare Queue dispatch, and sequential processing.
  */
 export function createTaskUsecase({
-  taskRepository,
+  taskRepository = null,
   queueService,
-  executeTask = defaultExecuteTask,
+  executeTask,
+  mockDelayMs = 5_000,
+  now = () => Date.now(),
+  generateId = generateUuidV7,
+  logger = console,
 }) {
-  async function enqueueTask({ name, payload = null }) {
-    const task = await taskRepository.create({
-      id: randomUUID(),
-      name,
-      payload,
-      status: "queued",
-      createdAt: new Date().toISOString(),
-      startedAt: null,
-      finishedAt: null,
-      result: null,
-      error: null,
-    });
+  const executor =
+    executeTask ?? createMockTaskExecutor({ delayMs: mockDelayMs, logger });
 
-    await queueService.enqueue({
-      taskId: task.id,
-      name: task.name,
-      payload: task.payload,
-    });
+  async function createTask({ title, description, parent_id = null, priority }) {
+    const nowMs = now();
+    const isoTimestamp = new Date(nowMs).toISOString();
 
-    return task;
-  }
-
-  async function getTask(id) {
-    const task = await taskRepository.findById(id);
-    if (!task) {
-      throw new NotFoundError(`Task not found: ${id}`);
-    }
-    return task;
-  }
-
-  async function listTasks() {
-    const [tasks, queueStats] = await Promise.all([
-      taskRepository.findAll(),
-      queueService.stats(),
-    ]);
-
-    return {
-      tasks,
-      stats: {
-        queuedCount: queueStats.queuedCount,
-        totalCount: tasks.length,
+    const taskMessage = {
+      schema: {
+        version: TASK_SCHEMA_VERSION,
+      },
+      metadata: {
+        created_at: isoTimestamp,
+        updated_at: isoTimestamp,
+      },
+      data: {
+        id: generateId(nowMs),
+        title,
+        description,
+        parent_id,
+        priority,
       },
     };
+
+    await queueService.enqueue(taskMessage);
+    logger.log(
+      `[task] Enqueued task id=${taskMessage.data.id} priority=${taskMessage.data.priority} title=${JSON.stringify(taskMessage.data.title)}`,
+    );
+
+    if (taskRepository) {
+      await taskRepository.create(taskMessage);
+    }
+
+    return taskMessage;
   }
 
   async function getStats() {
     const [totalCount, queueStats] = await Promise.all([
-      taskRepository.count(),
+      taskRepository ? taskRepository.count() : Promise.resolve(0),
       queueService.stats(),
     ]);
 
     return {
-      queuedCount: queueStats.queuedCount,
+      ...queueStats,
       totalCount,
     };
   }
 
   async function processNextTask({ signal } = {}) {
-    const message = await queueService.dequeue();
-    if (!message) {
+    const queueMessage = await queueService.dequeue({ signal });
+    if (!queueMessage) {
       return { processed: false, task: null };
     }
-
-    const existing = await taskRepository.findById(message.taskId);
-    if (!existing) {
-      await queueService.ack(message);
-      return { processed: false, task: null };
-    }
-
-    const runningTask = await taskRepository.update(existing.id, {
-      status: "running",
-      startedAt: new Date().toISOString(),
-    });
 
     try {
-      const result = await executeTask(runningTask, signal);
-      const completedTask = await taskRepository.update(existing.id, {
-        status: "completed",
-        result: result ?? null,
-        finishedAt: new Date().toISOString(),
-      });
-      await queueService.ack(message);
-      return { processed: true, task: completedTask };
+      const result = await executor(queueMessage.body, { queueMessage, signal });
+      await queueService.ack(queueMessage);
+      return {
+        processed: true,
+        task: queueMessage.body,
+        result,
+      };
     } catch (error) {
-      const failedTask = await taskRepository.update(existing.id, {
-        status: "failed",
+      if (error?.name === "AbortError" || signal?.aborted) {
+        return {
+          processed: false,
+          aborted: true,
+          task: queueMessage.body,
+        };
+      }
+
+      logger.error(
+        "[worker] Failed to process task:",
+        error instanceof Error ? error.message : String(error),
+      );
+      try {
+        await queueService.nack(queueMessage, error);
+      } catch (nackError) {
+        logger.error(
+          "[worker] Failed to nack task message:",
+          nackError instanceof Error ? nackError.message : String(nackError),
+        );
+      }
+
+      return {
+        processed: true,
+        task: queueMessage.body,
         error: error instanceof Error ? error.message : String(error),
-        finishedAt: new Date().toISOString(),
-      });
-      await queueService.nack(message, error);
-      return { processed: true, task: failedTask };
+      };
     }
   }
 
   return {
-    enqueueTask,
-    getTask,
-    listTasks,
+    createTask,
     getStats,
     processNextTask,
   };

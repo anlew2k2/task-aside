@@ -20,3 +20,17 @@ export class NotFoundError extends AppError {
     super(message, "NOT_FOUND");
   }
 }
+
+export class ConfigError extends AppError {
+  constructor(message) {
+    super(message, "CONFIG_ERROR");
+  }
+}
+
+export class QueueError extends AppError {
+  constructor(message, { statusCode = null, details = null } = {}) {
+    super(message, "QUEUE_ERROR");
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
