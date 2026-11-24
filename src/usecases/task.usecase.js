@@ -111,9 +111,23 @@ export function createTaskUsecase({
       return { processed: false, task: null };
     }
 
+    const startedAt = Date.now();
+    const taskId = queueMessage.body?.data?.id ?? null;
+    const title = queueMessage.body?.data?.title ?? "";
+    const priority = queueMessage.body?.data?.priority ?? "";
+    const attempts = queueMessage.attempts ?? 1;
+    const queueMessageId = queueMessage.queueMessageId ?? null;
+
+    logger.log(
+      `[worker] Processing task id=${taskId} priority=${priority} title=${JSON.stringify(title)} attempt=${attempts} queueMessageId=${queueMessageId}`,
+    );
+
     try {
       const result = await executor(queueMessage.body, { queueMessage, signal });
       await queueService.ack(queueMessage);
+      logger.log(
+        `[worker] Acked task id=${taskId} durationMs=${Date.now() - startedAt} result=${JSON.stringify(result)}`,
+      );
       return {
         processed: true,
         task: queueMessage.body,
@@ -121,6 +135,9 @@ export function createTaskUsecase({
       };
     } catch (error) {
       if (error?.name === "AbortError" || signal?.aborted) {
+        logger.log(
+          `[worker] Aborted task id=${taskId} durationMs=${Date.now() - startedAt} (not acked)`,
+        );
         return {
           processed: false,
           aborted: true,
@@ -129,14 +146,15 @@ export function createTaskUsecase({
       }
 
       logger.error(
-        "[worker] Failed to process task:",
+        `[worker] Failed to process task id=${taskId} durationMs=${Date.now() - startedAt}:`,
         error instanceof Error ? error.message : String(error),
       );
       try {
         await queueService.nack(queueMessage, error);
+        logger.log(`[worker] Nacked task id=${taskId} for retry`);
       } catch (nackError) {
         logger.error(
-          "[worker] Failed to nack task message:",
+          `[worker] Failed to nack task id=${taskId}:`,
           nackError instanceof Error ? nackError.message : String(nackError),
         );
       }
