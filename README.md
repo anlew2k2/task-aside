@@ -9,8 +9,18 @@ On startup, `task-aside` reads `~/.task-aside/settings.json` (or the path passed
 Key groups in `~/.task-aside/settings.json`:
 
 - `server`: `{ "host": "127.0.0.1", "port": 3100 }`
-- `transports`: `{ "http": true, "mcp": true, "worker": true }`
+- `transports`: `{ "http": true, "mcp": true, "worker": true, "telegram": false }`
 - `supabase`: `{ "url": "https://<project>.supabase.co", "publishable_key": "<key>", "schema": "public", "table": "tasks" }`
+- `telegram`:
+  - `bot_token`: Telegram Bot API token (required when `transports.telegram` is `true`)
+  - `user_id`: Paired Telegram sender user ID (set automatically by `task-aside auth telegram`)
+  - `chat_id`: Paired Telegram private chat ID (set automatically by `task-aside auth telegram`)
+  - `default_agent`: Default agent for Telegram intake (`null` falls back to first allowed worker agent)
+  - `default_priority`: Default task priority (`"P0"`–`"P3"`, default: `"P1"`)
+  - `workspaces`: Named workspace alias map (`{ "repo": "~/path/to/repo" }`)
+  - `default_workspace`: Default workspace alias or `null`
+  - `poll_timeout_seconds`: Long-polling timeout in seconds (`1`–`50`, default: `25`)
+  - `api_base_url`: Bot API base URL (default: `"https://api.telegram.org"`)
 - `logging`: `{ "dir": "~/.task-aside/logs" }`
 - `worker`:
   - `worker_id`: Optional worker identifier (`null` defaults to `<hostname>-<pid>`)
@@ -28,7 +38,7 @@ Key groups in `~/.task-aside/settings.json`:
 
 ## Supabase Schema
 
-Apply `migrations/schema.sql` to your Supabase Postgres database before running. It provisions `public.tasks` and the `claim_next_task` / `extend_task_lease` RPC functions.
+Apply `migrations/schema.sql` to your Supabase Postgres database before running. It provisions `public.tasks` and the `claim_next_task` / `extend_task_lease` RPC functions. For existing databases created before `cancelled` support, also apply `migrations/20261124_add_cancelled_status.sql`.
 
 ## Run
 
@@ -44,8 +54,9 @@ Local run without installing:
 node ./bin/task-aside.js
 ```
 
-## Options
+## Options & Commands
 
+- `task-aside auth telegram [-c <path>]` — Pair your Telegram `user_id` and `chat_id` using a 5-minute `/auth <token>` handshake and enable `transports.telegram`
 - `-c, --config <path>` — Path to `settings.json` (default: `~/.task-aside/settings.json`)
 - `-p, --port <port>` — HTTP/MCP port (overrides `settings.json` `server.port`)
 - `-H, --host <host>` — Bind host (overrides `settings.json` `server.host`)
@@ -155,6 +166,8 @@ curl -s -X POST http://127.0.0.1:3100/tasks \
 
 curl -s 'http://127.0.0.1:3100/tasks?status=completed&limit=20'
 curl -s http://127.0.0.1:3100/tasks/<uuid-v7>
+curl -s -X POST http://127.0.0.1:3100/tasks/<uuid-v7>/cancel
+curl -s -X POST http://127.0.0.1:3100/tasks/<uuid-v7>/retry
 ```
 
 Built-in MCP tools:
@@ -162,6 +175,14 @@ Built-in MCP tools:
 - `create_task` — create a task (`title`, `description`, `priority`, `execution`, optional `parent_id`)
 - `get_task` — fetch a task and its `result` envelope by `id`
 - `list_tasks` — list tasks with optional `status`, `agent`, `parent_id`, `limit`, `offset` filters
+- `cancel_task` — cancel a `queued` or `running` task by `id`
+- `retry_task` — enqueue a new task linked via `parent_id` from a terminal task by `id`
+
+Telegram commands (when `transports.telegram` is enabled):
+
+- Plain text opens a 1-tap Draft Card to adjust agent, priority, or workspace before running
+- Swipe-reply to any task card, completion notification, or `.md` attachment to resume or follow up
+- `/run <prompt>`, `/list [status]`, `/task <id>`, `/cancel <id>`, `/retry <id>`, `/use`, `/health`, `/help`
 
 ## Test
 

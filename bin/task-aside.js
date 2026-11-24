@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { parseArgs } from "node:util";
-import { startApp } from "#src/index.js";
+import { authTelegram, startApp } from "#src/index.js";
 import { getPackageInfo } from "#src/utilities/package-info.js";
 import { DEFAULT_SETTINGS_PATH } from "#src/utilities/settings.js";
 
@@ -12,6 +12,7 @@ function printHelp() {
 
 Usage:
   task-aside [options]
+  task-aside auth telegram [-c <path>]
 
 Options:
   -c, --config <path>   Path to settings.json (default: ${DEFAULT_SETTINGS_PATH})
@@ -23,8 +24,9 @@ Options:
 
 function parseCliArgs(argv) {
   let values;
+  let positionals;
   try {
-    ({ values } = parseArgs({
+    ({ values, positionals } = parseArgs({
       args: argv,
       options: {
         config: { type: "string", short: "c" },
@@ -34,7 +36,7 @@ function parseCliArgs(argv) {
         version: { type: "boolean", short: "v", default: false },
       },
       strict: true,
-      allowPositionals: false,
+      allowPositionals: true,
     }));
   } catch (error) {
     console.error(`Invalid arguments: ${error.message}`);
@@ -72,15 +74,40 @@ function parseCliArgs(argv) {
   const configPath = trimmedConfig ? trimmedConfig : undefined;
 
   return {
+    positionals,
     configPath,
     host,
     port,
   };
 }
 
-const config = parseCliArgs(process.argv.slice(2));
+const { positionals, ...config } = parseCliArgs(process.argv.slice(2));
 
-startApp(config).catch((error) => {
-  console.error(`Failed to start ${name}: ${error.message}`);
+if (positionals.length === 0) {
+  startApp(config).catch((error) => {
+    console.error(`Failed to start ${name}: ${error.message}`);
+    process.exit(1);
+  });
+} else if (positionals.length === 2 && positionals[0] === "auth" && positionals[1] === "telegram") {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  process.once("SIGINT", abort);
+  process.once("SIGTERM", abort);
+
+  authTelegram({ configPath: config.configPath, signal: controller.signal })
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((error) => {
+      if (error?.name === "AbortError") {
+        console.error("Telegram authentication cancelled.");
+      } else {
+        console.error(`Telegram authentication failed: ${error.message}`);
+      }
+      process.exit(1);
+    });
+} else {
+  console.error(`Unknown command: ${positionals.join(" ")}`);
+  printHelp();
   process.exit(1);
-});
+}

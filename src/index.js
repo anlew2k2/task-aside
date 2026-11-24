@@ -1,15 +1,17 @@
+import { readFileSync } from "node:fs";
 import { createHealthHandler } from "#src/handlers/health.handler.js";
 import { createTaskHandler } from "#src/handlers/task.handler.js";
 import { createSupabaseTaskRepository } from "#src/repositories/task.repository.js";
 import { createAgentService } from "#src/services/agent.service.js";
 import { createHttpTransport } from "#src/transports/http.js";
 import { createMcpTransport } from "#src/transports/mcp.js";
+import { authenticateTelegram, createTelegramTransport } from "#src/transports/telegram.js";
 import { createWorkerTransport } from "#src/transports/worker.js";
 import { createTaskUsecase } from "#src/usecases/task.usecase.js";
 import { ConfigError } from "#src/utilities/errors.js";
 import { createFileLogger } from "#src/utilities/logger.js";
 import { getPackageInfo } from "#src/utilities/package-info.js";
-import { loadSettings, validateSettings } from "#src/utilities/settings.js";
+import { loadSettings, saveSettings, validateSettings } from "#src/utilities/settings.js";
 
 /**
  * Composition root: wires settings -> repositories -> services -> usecases -> handlers -> transports.
@@ -28,6 +30,8 @@ export async function startApp({
   enableHttp = undefined,
   enableMcp = undefined,
   enableWorker = undefined,
+  enableTelegram = undefined,
+  telegramFetch = undefined,
   startWorker = undefined,
 } = {}) {
   const appInfo = getPackageInfo();
@@ -39,11 +43,13 @@ export async function startApp({
   if (settings !== undefined) {
     resolvedSettings = validateSettings(settings, {
       requireSupabase: !taskRepository,
+      requireTelegram: enableTelegram,
     });
   } else {
     const loaded = loadSettings({
       configPath,
       requireSupabase: !taskRepository,
+      requireTelegram: enableTelegram,
     });
     resolvedSettings = loaded.settings;
     settingsPath = loaded.path;
@@ -54,10 +60,16 @@ export async function startApp({
   const resolvedEnableMcp = enableMcp ?? resolvedSettings.transports.mcp;
   const resolvedEnableWorker =
     enableWorker ?? startWorker ?? resolvedSettings.transports.worker;
+  const resolvedEnableTelegram = enableTelegram ?? resolvedSettings.transports.telegram;
 
-  if (!resolvedEnableHttp && !resolvedEnableMcp && !resolvedEnableWorker) {
+  if (
+    !resolvedEnableHttp &&
+    !resolvedEnableMcp &&
+    !resolvedEnableWorker &&
+    !resolvedEnableTelegram
+  ) {
     throw new ConfigError(
-      "At least one of transports.http, transports.mcp, or transports.worker must be enabled",
+      "At least one of transports.http, transports.mcp, transports.worker, or transports.telegram must be enabled",
     );
   }
 
@@ -73,6 +85,7 @@ export async function startApp({
     http: resolvedEnableHttp,
     mcp: resolvedEnableMcp,
     worker: resolvedEnableWorker,
+    telegram: resolvedEnableTelegram,
   };
 
   const resolvedTaskRepository =
@@ -131,8 +144,24 @@ export async function startApp({
       })
     : null;
 
+  const telegramTransport = resolvedEnableTelegram
+    ? createTelegramTransport({
+        taskHandler,
+        healthHandler,
+        telegramConfig: resolvedSettings.telegram,
+        workerConfig: resolvedSettings.worker,
+        getWorkerStatus,
+        transports,
+        ...(telegramFetch ? { fetchImpl: telegramFetch } : {}),
+        logger: resolvedLogger,
+      })
+    : null;
+
   if (resolvedEnableWorker) {
     workerTransport.start();
+  }
+  if (telegramTransport) {
+    telegramTransport.start();
   }
 
   let binding = { host: null, port: null, url: null };
@@ -142,6 +171,9 @@ export async function startApp({
     try {
       binding = await httpTransport.listen({ host: resolvedHost, port: resolvedPort });
     } catch (error) {
+      if (telegramTransport) {
+        await telegramTransport.stop();
+      }
       await workerTransport.stop();
       if (ownsLogger) {
         await resolvedLogger.close?.();
@@ -164,6 +196,9 @@ export async function startApp({
   resolvedLogger.log(
     `Worker:   ${resolvedEnableWorker ? `running (id=${resolvedSettings.worker.worker_id})` : "disabled"}`,
   );
+  resolvedLogger.log(
+    `Telegram: ${resolvedEnableTelegram ? `running (chat=${resolvedSettings.telegram.chat_id})` : "disabled"}`,
+  );
   resolvedLogger.log(`Agents:   ${resolvedSettings.worker.allowed_agents.join(", ")}`);
   resolvedLogger.log(`Runs:     ${resolvedSettings.worker.runs_dir}`);
   if (ownsLogger && resolvedLogger.getCurrentLogFile) {
@@ -183,6 +218,9 @@ export async function startApp({
         await httpTransport.close();
       }
       await workerTransport.stop();
+      if (telegramTransport) {
+        await telegramTransport.stop();
+      }
       if (ownsLogger) {
         await resolvedLogger.close?.();
       }
@@ -209,7 +247,78 @@ export async function startApp({
     runsDir: resolvedSettings.worker.runs_dir,
     transports,
     workerTransport,
+    telegramTransport,
     httpTransport,
     stop,
+  };
+}
+
+/**
+ * Interactive Telegram pairing flow: generates a 5-minute token, waits for `/auth <token>`,
+ * and persists `telegram.user_id`, `telegram.chat_id`, and `transports.telegram = true`.
+ */
+export async function authTelegram({
+  configPath = undefined,
+  ttlMs = 300_000,
+  pollTimeoutSeconds = undefined,
+  token = undefined,
+  fetchImpl = undefined,
+  signal = undefined,
+  logger = console,
+} = {}) {
+  const { settings, path: settingsPath } = loadSettings({
+    configPath,
+    requireSupabase: false,
+    requireTelegram: false,
+  });
+
+  if (!settings.telegram.bot_token) {
+    throw new ConfigError(
+      `telegram.bot_token is required in ${settingsPath} before running auth telegram`,
+    );
+  }
+
+  const result = await authenticateTelegram({
+    botToken: settings.telegram.bot_token,
+    apiBaseUrl: settings.telegram.api_base_url,
+    ttlMs,
+    pollTimeoutSeconds: pollTimeoutSeconds ?? settings.telegram.poll_timeout_seconds,
+    token,
+    fetchImpl,
+    signal,
+    onPrompt: ({ botUrl, token: pairToken, expiresInSeconds }) => {
+      logger.log(`Open ${botUrl} in Telegram and send:`);
+      logger.log(`  /auth ${pairToken}`);
+      logger.log(`Waiting up to ${expiresInSeconds}s for confirmation...`);
+    },
+  });
+
+  const rawSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  rawSettings.transports = {
+    ...(rawSettings.transports ?? {}),
+    telegram: true,
+  };
+  const updatedTelegram = {
+    ...(rawSettings.telegram ?? {}),
+    user_id: result.userId,
+    chat_id: result.chatId,
+  };
+  delete updatedTelegram.allowed_chat_ids;
+  rawSettings.telegram = updatedTelegram;
+
+  saveSettings(settingsPath, rawSettings);
+  loadSettings({
+    configPath: settingsPath,
+    requireSupabase: false,
+    requireTelegram: true,
+  });
+
+  logger.log(
+    `Telegram authenticated: user_id=${result.userId}, chat_id=${result.chatId}. Saved to ${settingsPath} with transports.telegram=true.`,
+  );
+
+  return {
+    ...result,
+    settingsPath,
   };
 }

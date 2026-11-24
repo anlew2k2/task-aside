@@ -6,7 +6,7 @@ create table if not exists public.tasks (
   priority text not null check (priority in ('P0', 'P1', 'P2', 'P3')),
   agent text not null check (agent in ('agy', 'claude', 'codex')),
   status text not null default 'queued' check (
-    status in ('queued', 'running', 'completed', 'failed', 'timeout', 'interrupted')
+    status in ('queued', 'running', 'completed', 'failed', 'timeout', 'interrupted', 'cancelled')
   ),
   input_envelope jsonb not null,
   result_envelope jsonb null,

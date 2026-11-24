@@ -93,7 +93,8 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
       return;
     }
     if (req.method === "PATCH") {
-      res.end(JSON.stringify([{ ...baseRow, status: "completed", worker_id: "w-1" }]));
+      const nextStatus = body?.status ?? "completed";
+      res.end(JSON.stringify([{ ...baseRow, status: nextStatus, worker_id: "w-1" }]));
       return;
     }
     if (req.method === "DELETE") {
@@ -143,6 +144,13 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
   });
   assert.equal(finished.status, "completed");
 
+  const cancelled = await repo.cancelTask({
+    taskId: sampleEnvelope.data.id,
+    resultEnvelope: { schema: { version: "v1", type: "task_result" }, data: { status: "cancelled" } },
+    finishedAt: "2026-11-24T10:02:00.000Z",
+  });
+  assert.equal(cancelled.status, "cancelled");
+
   const stats = await repo.stats();
   assert.equal(stats.provider, "supabase");
   assert.equal(stats.counts.total, 2);
@@ -158,6 +166,15 @@ test("Supabase task repository executes REST & RPC lifecycle with expected heade
   assert.equal(requests[2].url.includes("parent_id=is.null"), true);
   assert.equal(requests[2].url.includes("status=eq.queued"), true);
   assert.equal(requests[2].url.includes("agent=eq.codex"), true);
+  const finishReq = requests.find(
+    (r) => r.method === "PATCH" && r.url.includes("status=eq.running"),
+  );
+  assert.ok(finishReq, "finishTask PATCH must filter status=eq.running");
+  const cancelReq = requests.find(
+    (r) => r.method === "PATCH" && r.url.includes("status=in.%28queued%2Crunning%29"),
+  );
+  assert.ok(cancelReq, "cancelTask PATCH must filter status=in.(queued,running)");
+  assert.equal(cancelReq.body.status, "cancelled");
 });
 
 test("Supabase task repository throws StorageError on error without leaking key", async (t) => {

@@ -276,12 +276,34 @@ export function createSupabaseTaskRepository({
     const params = new URLSearchParams();
     params.set("id", `eq.${taskId}`);
     params.set("worker_id", `eq.${workerId}`);
+    params.set("status", "eq.running");
 
     const payload = await request(`/rest/v1/${encodedTable}?${params.toString()}`, {
       method: "PATCH",
       headers: { Prefer: "return=representation" },
       body: {
         status,
+        result_envelope: resultEnvelope,
+        lease_expires_at: null,
+        finished_at: finishedAt,
+        updated_at: finishedAt,
+      },
+    });
+
+    const row = Array.isArray(payload) ? payload[0] : payload;
+    return mapRowToTaskRecord(row ?? null);
+  }
+
+  async function cancelTask({ taskId, resultEnvelope, finishedAt } = {}) {
+    const params = new URLSearchParams();
+    params.set("id", `eq.${taskId}`);
+    params.set("status", "in.(queued,running)");
+
+    const payload = await request(`/rest/v1/${encodedTable}?${params.toString()}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: {
+        status: "cancelled",
         result_envelope: resultEnvelope,
         lease_expires_at: null,
         finished_at: finishedAt,
@@ -326,6 +348,7 @@ export function createSupabaseTaskRepository({
     claimNext,
     extendLease,
     finishTask,
+    cancelTask,
     deleteById,
     stats,
   };
@@ -455,10 +478,23 @@ export function createInMemoryTaskRepository({ now = () => Date.now() } = {}) {
 
   async function finishTask({ taskId, workerId, status, resultEnvelope, finishedAt } = {}) {
     const record = tasks.get(taskId);
-    if (!record || record.worker_id !== workerId) {
+    if (!record || record.worker_id !== workerId || record.status !== "running") {
       return null;
     }
     record.status = status;
+    record.result = structuredClone(resultEnvelope);
+    record.lease_expires_at = null;
+    record.finished_at = finishedAt;
+    record.updated_at = finishedAt;
+    return cloneRecord(record);
+  }
+
+  async function cancelTask({ taskId, resultEnvelope, finishedAt } = {}) {
+    const record = tasks.get(taskId);
+    if (!record || (record.status !== "queued" && record.status !== "running")) {
+      return null;
+    }
+    record.status = "cancelled";
     record.result = structuredClone(resultEnvelope);
     record.lease_expires_at = null;
     record.finished_at = finishedAt;
@@ -492,6 +528,7 @@ export function createInMemoryTaskRepository({ now = () => Date.now() } = {}) {
     claimNext,
     extendLease,
     finishTask,
+    cancelTask,
     deleteById,
     stats,
   };

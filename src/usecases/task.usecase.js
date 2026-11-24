@@ -1,4 +1,4 @@
-import { NotFoundError } from "#src/utilities/errors.js";
+import { ConflictError, NotFoundError } from "#src/utilities/errors.js";
 import { createTraceContext } from "#src/utilities/otel.js";
 import { generateUuidV7 } from "#src/utilities/uuid.js";
 import { TASK_RESULT_SCHEMA_TYPE, TASK_SCHEMA_VERSION } from "#src/utilities/validation.js";
@@ -17,6 +17,48 @@ export function createTaskUsecase({
   createTrace = createTraceContext,
   logger = console,
 }) {
+  const listeners = new Set();
+  const activeRuns = new Map();
+
+  function subscribe(listener) {
+    if (typeof listener !== "function") {
+      throw new TypeError("Task listener must be a function");
+    }
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  }
+
+  function emitEvent(type, payload) {
+    if (listeners.size === 0) {
+      return;
+    }
+    const event = {
+      type,
+      timestamp: new Date(now()).toISOString(),
+      ...payload,
+    };
+    for (const listener of Array.from(listeners)) {
+      try {
+        const result = listener(event);
+        if (result && typeof result.catch === "function") {
+          result.catch((error) => {
+            logger.error(
+              `[usecase] Task event listener error (${type}):`,
+              error instanceof Error ? error.message : String(error),
+            );
+          });
+        }
+      } catch (error) {
+        logger.error(
+          `[usecase] Task event listener error (${type}):`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  }
+
   const executor =
     executeTask ??
     ((taskEnvelope, context) => {
@@ -33,6 +75,7 @@ export function createTaskUsecase({
     finishedAtMs,
     error,
     outputText = null,
+    workerIdOverride = undefined,
   }) {
     const taskData = taskEnvelope?.data ?? {};
     const taskMeta = taskEnvelope?.metadata ?? {};
@@ -61,7 +104,7 @@ export function createTaskUsecase({
         status,
         execution: {
           agent: execReq.agent ?? null,
-          worker_id: workerConfig.worker_id,
+          worker_id: workerIdOverride !== undefined ? workerIdOverride : workerConfig.worker_id,
           requested_model: execReq.model ?? null,
           effective_model: null,
           effort: execReq.effort ?? null,
@@ -70,9 +113,9 @@ export function createTaskUsecase({
           enforcement: null,
           session_id: execReq.session_id ?? null,
           exit_code: null,
-          started_at: new Date(startedAtMs).toISOString(),
+          started_at: startedAtMs !== null ? new Date(startedAtMs).toISOString() : null,
           finished_at: createdAt,
-          duration_ms: Math.max(0, finishedAtMs - startedAtMs),
+          duration_ms: startedAtMs !== null ? Math.max(0, finishedAtMs - startedAtMs) : null,
         },
         output: {
           format: "markdown",
@@ -127,10 +170,11 @@ export function createTaskUsecase({
       },
     };
 
-    await taskRepository.create(taskMessage);
+    const record = await taskRepository.create(taskMessage);
     logger.log(
       `[task] Enqueued task id=${taskMessage.data.id} agent=${execution.agent} priority=${priority} title=${JSON.stringify(title)} trace_id=${traceId} span_id=${spanId}`,
     );
+    emitEvent("task.created", { record, task: taskMessage });
 
     return taskMessage;
   }
@@ -184,10 +228,30 @@ export function createTaskUsecase({
     logger.log(
       `[worker] Claimed task id=${taskId} agent=${agent} priority=${priority} title=${JSON.stringify(title)} attempt=${claimed.attempts} workerId=${workerConfig.worker_id} trace_id=${traceId} span_id=${spanId}`,
     );
+    emitEvent("task.started", { record: claimed });
+
+    const taskController = new AbortController();
+    const runEntry = {
+      controller: taskController,
+      cancelled: false,
+      cancelledLocally: false,
+    };
+    activeRuns.set(taskId, runEntry);
+
+    const onWorkerAbort = () => {
+      taskController.abort();
+    };
+    if (signal) {
+      if (signal.aborted) {
+        taskController.abort();
+      } else {
+        signal.addEventListener("abort", onWorkerAbort, { once: true });
+      }
+    }
 
     let heartbeatInFlight = false;
     const heartbeatTimer = setInterval(() => {
-      if (heartbeatInFlight || signal?.aborted) {
+      if (heartbeatInFlight || signal?.aborted || taskController.signal.aborted) {
         return;
       }
       heartbeatInFlight = true;
@@ -196,6 +260,12 @@ export function createTaskUsecase({
           taskId,
           workerId: workerConfig.worker_id,
           leaseSeconds: workerConfig.lease_seconds,
+        })
+        .then((extended) => {
+          if (!extended && !signal?.aborted) {
+            runEntry.cancelled = true;
+            taskController.abort();
+          }
         })
         .catch((error) => {
           logger.error(
@@ -217,7 +287,7 @@ export function createTaskUsecase({
       const outcome = await executor(taskEnvelope, {
         attempt: claimed.attempts,
         workerId: workerConfig.worker_id,
-        signal,
+        signal: taskController.signal,
       });
 
       if (outcome && typeof outcome === "object" && outcome.resultEnvelope) {
@@ -241,13 +311,13 @@ export function createTaskUsecase({
         });
       }
 
-      if (finalStatus === "interrupted" || signal?.aborted) {
+      if (!runEntry.cancelled && (finalStatus === "interrupted" || signal?.aborted)) {
         aborted = true;
         finalStatus = "interrupted";
       }
     } catch (error) {
       const finishedAtMs = now();
-      aborted = error?.name === "AbortError" || Boolean(signal?.aborted);
+      aborted = !runEntry.cancelled && (error?.name === "AbortError" || Boolean(signal?.aborted));
       finalStatus = aborted ? "interrupted" : "failed";
       resultEnvelope = buildFallbackResultEnvelope({
         taskEnvelope,
@@ -262,14 +332,37 @@ export function createTaskUsecase({
       });
     } finally {
       clearInterval(heartbeatTimer);
+      if (signal) {
+        signal.removeEventListener("abort", onWorkerAbort);
+      }
+      activeRuns.delete(taskId);
+    }
+
+    if (runEntry.cancelled) {
+      const latest = await taskRepository.findById(taskId).catch(() => null);
+      if (!runEntry.cancelledLocally && latest?.status === "cancelled") {
+        emitEvent("task.cancelled", { record: latest, previousStatus: "running" });
+      }
+      logger.log(
+        `[worker] Task cancelled during execution id=${taskId} agent=${agent} trace_id=${traceId} span_id=${spanId}`,
+      );
+      return {
+        processed: true,
+        aborted: false,
+        cancelled: true,
+        task: taskEnvelope,
+        status: "cancelled",
+        result: latest?.result ?? null,
+      };
     }
 
     const finishedAtIso =
       resultEnvelope?.data?.execution?.finished_at ?? new Date(now()).toISOString();
 
+    let persisted;
     try {
       // Do not forward an aborted worker signal here so interrupted status always persists.
-      await taskRepository.finishTask({
+      persisted = await taskRepository.finishTask({
         taskId,
         workerId: workerConfig.worker_id,
         status: finalStatus,
@@ -293,11 +386,33 @@ export function createTaskUsecase({
       throw finishError;
     }
 
+    if (!persisted) {
+      const latest = await taskRepository.findById(taskId).catch(() => null);
+      if (latest?.status === "cancelled") {
+        if (!runEntry.cancelledLocally) {
+          emitEvent("task.cancelled", { record: latest, previousStatus: "running" });
+        }
+        return {
+          processed: true,
+          aborted: false,
+          cancelled: true,
+          task: taskEnvelope,
+          status: "cancelled",
+          result: latest.result ?? null,
+        };
+      }
+    }
+
     const durationMs = Math.max(0, now() - startedAtMs);
     const resultFile = resultEnvelope?.data?.artifacts?.result_file ?? null;
     logger.log(
       `[worker] Finished task id=${taskId} agent=${agent} status=${finalStatus} durationMs=${durationMs} resultFile=${resultFile} trace_id=${traceId} span_id=${spanId}`,
     );
+    emitEvent("task.finished", {
+      record: persisted,
+      status: finalStatus,
+      result: resultEnvelope,
+    });
 
     return {
       processed: !aborted,
@@ -308,11 +423,83 @@ export function createTaskUsecase({
     };
   }
 
+  async function cancelTask(id) {
+    const record = await taskRepository.findById(id);
+    if (!record) {
+      throw new NotFoundError(`Task not found: ${id}`);
+    }
+    if (record.status !== "queued" && record.status !== "running") {
+      throw new ConflictError(
+        `Task ${id} cannot be cancelled from status "${record.status}"`,
+      );
+    }
+
+    const finishedAtMs = now();
+    const startedAtMs = record.started_at ? Date.parse(record.started_at) : null;
+    const resultEnvelope = buildFallbackResultEnvelope({
+      taskEnvelope: record.task,
+      status: "cancelled",
+      startedAtMs,
+      finishedAtMs,
+      workerIdOverride: record.worker_id ?? null,
+      error: {
+        code: "CANCELLED",
+        category: "user",
+        message: "Task cancelled by user",
+      },
+    });
+
+    const cancelled = await taskRepository.cancelTask({
+      taskId: id,
+      resultEnvelope,
+      finishedAt: resultEnvelope.data.execution.finished_at,
+    });
+    if (!cancelled) {
+      throw new ConflictError(`Task ${id} could not be cancelled (status changed)`);
+    }
+
+    const active = activeRuns.get(id);
+    if (active) {
+      active.cancelled = true;
+      active.cancelledLocally = true;
+      active.controller.abort();
+    }
+
+    logger.log(`[task] Cancelled task id=${id} previousStatus=${record.status}`);
+    emitEvent("task.cancelled", { record: cancelled, previousStatus: record.status });
+    return cancelled;
+  }
+
+  async function retryTask(id, { traceparent = null } = {}) {
+    const record = await taskRepository.findById(id);
+    if (!record) {
+      throw new NotFoundError(`Task not found: ${id}`);
+    }
+    if (record.status === "queued" || record.status === "running") {
+      throw new ConflictError(
+        `Task ${id} cannot be retried while status is "${record.status}"`,
+      );
+    }
+
+    const origData = record.task?.data ?? {};
+    return createTask({
+      title: origData.title,
+      description: origData.description,
+      parent_id: record.id,
+      priority: origData.priority ?? record.priority,
+      execution: structuredClone(origData.execution ?? { agent: record.agent }),
+      traceparent,
+    });
+  }
+
   return {
     createTask,
     getTask,
     listTasks,
+    cancelTask,
+    retryTask,
     getStats,
     processNextTask,
+    subscribe,
   };
 }

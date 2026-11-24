@@ -21,6 +21,12 @@ export class NotFoundError extends AppError {
   }
 }
 
+export class ConflictError extends AppError {
+  constructor(message) {
+    super(message, "CONFLICT");
+  }
+}
+
 export class ConfigError extends AppError {
   constructor(message) {
     super(message, "CONFIG_ERROR");

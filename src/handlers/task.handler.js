@@ -72,10 +72,30 @@ export function createTaskHandler({ taskUsecase }) {
     return taskUsecase.processNextTask({ signal });
   }
 
+  async function cancelTask(input) {
+    const args = assertPlainObject(input, "Task cancel input must be an object");
+    const id = assertUuidV7(args.id, "id");
+    return taskUsecase.cancelTask(id);
+  }
+
+  async function retryTask(input, context = {}) {
+    const args = assertPlainObject(input, "Task retry input must be an object");
+    const id = assertUuidV7(args.id, "id");
+    const traceparent = typeof context?.traceparent === "string" ? context.traceparent : null;
+    return taskUsecase.retryTask(id, { traceparent });
+  }
+
+  function subscribe(listener) {
+    return taskUsecase.subscribe(listener);
+  }
+
   return {
     createTask,
     getTask,
     listTasks,
+    cancelTask,
+    retryTask,
     processNextTask,
+    subscribe,
   };
 }

@@ -30,6 +30,15 @@ test("loadSettings creates default settings.json with 0600 mode when missing", (
   assert.equal(settings.logging.dir, join(dir, ".task-aside", "logs"));
   assert.equal(settings.worker.runs_dir, join(dir, ".task-aside", "runs"));
   assert.equal(settings.worker.default_cwd, dir);
+  assert.equal(settings.transports.telegram, false);
+  assert.equal(settings.telegram.default_agent, "agy");
+  assert.equal(settings.telegram.default_priority, "P1");
+  assert.equal(settings.worker.agents.agy.default_model, "gemini-pro-orchestrator-neon");
+  assert.equal(settings.worker.agents.agy.default_effort, "high");
+  assert.equal(settings.worker.agents.claude.default_model, "sonnet");
+  assert.equal(settings.worker.agents.claude.default_effort, "high");
+  assert.equal(settings.worker.agents.codex.default_model, "sol");
+  assert.equal(settings.worker.agents.codex.default_effort, "high");
 
   const mode = statSync(configPath).mode & 0o777;
   assert.equal(mode, 0o600);
@@ -143,4 +152,82 @@ test("loadSettings throws ConfigError on invalid JSON", (t) => {
     () => loadSettings({ configPath }),
     (err) => err instanceof ConfigError && /Invalid JSON/.test(err.message),
   );
+});
+
+test("validateSettings validates telegram config, expands workspaces, and never leaks bot_token", () => {
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          transports: { telegram: true },
+          telegram: {
+            bot_token: "",
+            user_id: 1001,
+            chat_id: 1001,
+          },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /bot_token/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          transports: { telegram: true },
+          telegram: {
+            bot_token: "secret-telegram-token-xyz",
+            user_id: null,
+            chat_id: null,
+          },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.match(err.message, /user_id/);
+      assert.equal(err.message.includes("secret-telegram-token-xyz"), false);
+      return true;
+    },
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          telegram: {
+            default_workspace: "missing-alias",
+            workspaces: { repo: "~/code/repo" },
+          },
+        },
+        { requireSupabase: false, home: "/Users/tester" },
+      ),
+    (err) => err instanceof ConfigError && /default_workspace/.test(err.message),
+  );
+
+  const normalized = validateSettings(
+    {
+      transports: { telegram: true },
+      telegram: {
+        bot_token: "secret-telegram-token-xyz",
+        user_id: 12345,
+        chat_id: "12345",
+        default_agent: "claude",
+        default_priority: "P0",
+        default_workspace: "main",
+        workspaces: { main: "~/projects/main" },
+        api_base_url: "https://api.telegram.org/",
+      },
+    },
+    { requireSupabase: false, home: "/Users/tester" },
+  );
+
+  assert.equal(normalized.telegram.user_id, "12345");
+  assert.equal(normalized.telegram.chat_id, "12345");
+  assert.equal(normalized.telegram.default_agent, "claude");
+  assert.equal(normalized.telegram.default_priority, "P0");
+  assert.equal(normalized.telegram.default_workspace, "main");
+  assert.equal(normalized.telegram.workspaces.main, "/Users/tester/projects/main");
+  assert.equal(normalized.telegram.api_base_url, "https://api.telegram.org");
 });

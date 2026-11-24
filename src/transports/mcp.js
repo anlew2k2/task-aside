@@ -1,4 +1,9 @@
-import { NotFoundError, StorageError, ValidationError } from "#src/utilities/errors.js";
+import {
+  ConflictError,
+  NotFoundError,
+  StorageError,
+  ValidationError,
+} from "#src/utilities/errors.js";
 import { readJsonBody, sendEmpty, sendJson } from "#src/utilities/http.js";
 import {
   isPlainObject,
@@ -127,6 +132,37 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "cancel_task",
+    description: "Cancel a queued or running task by UUID v7 id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Task UUID v7",
+        },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "retry_task",
+    description:
+      "Create a new queued task retrying a finished, failed, timed out, interrupted, or cancelled task linked via parent_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "Task UUID v7 to retry",
+        },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 function jsonRpcResult(id, result) {
@@ -187,11 +223,25 @@ export function createMcpTransport({
           return formatToolResponse(result);
         }
 
+        case "cancel_task": {
+          const task = await taskHandler.cancelTask(input);
+          return formatToolResponse(task);
+        }
+
+        case "retry_task": {
+          const task = await taskHandler.retryTask(input, context);
+          return formatToolResponse(task);
+        }
+
         default:
           throw new ValidationError(`Unknown tool: ${name}`);
       }
     } catch (error) {
-      if (error instanceof StorageError || error instanceof NotFoundError) {
+      if (
+        error instanceof StorageError ||
+        error instanceof NotFoundError ||
+        error instanceof ConflictError
+      ) {
         return formatToolResponse({ error: error.message, code: error.code }, true);
       }
       throw error;

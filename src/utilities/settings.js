@@ -7,6 +7,7 @@ import {
   PERMISSION_MODE_RANK,
   PERMISSION_MODES,
   SUPPORTED_AGENTS,
+  TASK_PRIORITIES,
 } from "#src/utilities/validation.js";
 
 export const DEFAULT_HOME_DIR = join(homedir(), ".task-aside");
@@ -22,12 +23,24 @@ export function createDefaultSettings() {
       http: true,
       mcp: true,
       worker: true,
+      telegram: false,
     },
     supabase: {
       url: "",
       publishable_key: "",
       schema: "public",
       table: "tasks",
+    },
+    telegram: {
+      bot_token: "",
+      user_id: null,
+      chat_id: null,
+      default_agent: null,
+      default_priority: "P1",
+      default_workspace: null,
+      workspaces: {},
+      poll_timeout_seconds: 25,
+      api_base_url: "https://api.telegram.org",
     },
     logging: {
       dir: "~/.task-aside/logs",
@@ -47,18 +60,18 @@ export function createDefaultSettings() {
       agents: {
         agy: {
           executable: "agy",
-          default_model: null,
-          default_effort: null,
+          default_model: "gemini-pro-orchestrator-neon",
+          default_effort: "high",
         },
         claude: {
           executable: "claude",
-          default_model: null,
-          default_effort: null,
+          default_model: "sonnet",
+          default_effort: "high",
         },
         codex: {
           executable: "codex",
-          default_model: null,
-          default_effort: null,
+          default_model: "sol",
+          default_effort: "high",
           skip_git_repo_check: false,
         },
       },
@@ -127,12 +140,39 @@ function assertPositiveConfigInt(value, fieldName, { min = 1 } = {}) {
   return value;
 }
 
+function assertNullableTelegramId(value, fieldName) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new ConfigError(`${fieldName} must be an integer, numeric string, or null`);
+    }
+    return String(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      return null;
+    }
+    if (/^-?\d+$/.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  throw new ConfigError(`${fieldName} must be an integer, numeric string, or null`);
+}
+
 /**
  * Validate and normalize settings loaded from ~/.task-aside/settings.json or passed in memory.
  */
 export function validateSettings(
   rawSettings,
-  { requireSupabase = true, cwd = process.cwd(), home = homedir() } = {},
+  {
+    requireSupabase = true,
+    requireTelegram = undefined,
+    cwd = process.cwd(),
+    home = homedir(),
+  } = {},
 ) {
   if (!isPlainObject(rawSettings)) {
     throw new ConfigError("Settings root must be a JSON object");
@@ -158,6 +198,7 @@ export function validateSettings(
     http: assertConfigBoolean(merged.transports.http, "transports.http"),
     mcp: assertConfigBoolean(merged.transports.mcp, "transports.mcp"),
     worker: assertConfigBoolean(merged.transports.worker, "transports.worker"),
+    telegram: assertConfigBoolean(merged.transports.telegram, "transports.telegram"),
   };
 
   // Supabase
@@ -324,6 +365,95 @@ export function validateSettings(
     }
   }
 
+  // Telegram
+  if (!isPlainObject(merged.telegram)) {
+    throw new ConfigError("telegram must be an object");
+  }
+  const tg = merged.telegram;
+  const telegramEnabled = requireTelegram ?? transports.telegram;
+
+  if (typeof tg.bot_token !== "string") {
+    throw new ConfigError("telegram.bot_token must be a string");
+  }
+  const botToken = tg.bot_token.trim();
+  if (telegramEnabled && !botToken) {
+    throw new ConfigError("telegram.bot_token is required when transports.telegram is enabled");
+  }
+
+  const tgUserId = assertNullableTelegramId(tg.user_id, "telegram.user_id");
+  const tgChatId = assertNullableTelegramId(tg.chat_id, "telegram.chat_id");
+  if (telegramEnabled && (!tgUserId || !tgChatId)) {
+    throw new ConfigError(
+      "telegram.user_id and telegram.chat_id are required when transports.telegram is enabled (run `task-aside auth telegram`)",
+    );
+  }
+
+  const rawTgDefaultAgent = assertNullableConfigString(
+    tg.default_agent,
+    "telegram.default_agent",
+  );
+  if (rawTgDefaultAgent !== null && !SUPPORTED_AGENTS.includes(rawTgDefaultAgent)) {
+    throw new ConfigError(
+      `telegram.default_agent must be one of: ${SUPPORTED_AGENTS.join(", ")} or null`,
+    );
+  }
+  const tgDefaultAgent = rawTgDefaultAgent ?? allowedAgents[0];
+
+  if (
+    typeof tg.default_priority !== "string" ||
+    !TASK_PRIORITIES.includes(tg.default_priority)
+  ) {
+    throw new ConfigError(
+      `telegram.default_priority must be one of: ${TASK_PRIORITIES.join(", ")}`,
+    );
+  }
+
+  if (!isPlainObject(tg.workspaces)) {
+    throw new ConfigError("telegram.workspaces must be an object");
+  }
+  const workspaces = {};
+  for (const [aliasKey, rawWorkspacePath] of Object.entries(tg.workspaces)) {
+    const alias = assertNonEmptyConfigString(aliasKey, "telegram.workspaces key");
+    if (alias in workspaces) {
+      throw new ConfigError(`Duplicate telegram.workspaces alias "${alias}"`);
+    }
+    const workspacePath = assertNonEmptyConfigString(
+      rawWorkspacePath,
+      `telegram.workspaces.${alias}`,
+    );
+    workspaces[alias] = expandHomePath(workspacePath, { cwd, home });
+  }
+
+  const tgDefaultWorkspace = assertNullableConfigString(
+    tg.default_workspace,
+    "telegram.default_workspace",
+  );
+  if (tgDefaultWorkspace !== null && !(tgDefaultWorkspace in workspaces)) {
+    throw new ConfigError(
+      `telegram.default_workspace "${tgDefaultWorkspace}" must match a key in telegram.workspaces`,
+    );
+  }
+
+  const pollTimeoutSeconds = assertPositiveConfigInt(
+    tg.poll_timeout_seconds,
+    "telegram.poll_timeout_seconds",
+  );
+  if (pollTimeoutSeconds > 50) {
+    throw new ConfigError("telegram.poll_timeout_seconds must be an integer between 1 and 50");
+  }
+
+  const rawTgApiUrl = assertNonEmptyConfigString(tg.api_base_url, "telegram.api_base_url");
+  let parsedTgApiUrl;
+  try {
+    parsedTgApiUrl = new URL(rawTgApiUrl);
+  } catch {
+    throw new ConfigError("telegram.api_base_url must be a valid http(s) URL");
+  }
+  if (parsedTgApiUrl.protocol !== "http:" && parsedTgApiUrl.protocol !== "https:") {
+    throw new ConfigError("telegram.api_base_url must use http or https protocol");
+  }
+  const apiBaseUrl = rawTgApiUrl.replace(/\/+$/, "");
+
   return {
     server: { host, port },
     transports,
@@ -332,6 +462,17 @@ export function validateSettings(
       publishable_key: rawKey,
       schema,
       table,
+    },
+    telegram: {
+      bot_token: botToken,
+      user_id: tgUserId,
+      chat_id: tgChatId,
+      default_agent: tgDefaultAgent,
+      default_priority: tg.default_priority,
+      default_workspace: tgDefaultWorkspace,
+      workspaces,
+      poll_timeout_seconds: pollTimeoutSeconds,
+      api_base_url: apiBaseUrl,
     },
     logging: { dir: logDir },
     worker: {
@@ -359,6 +500,7 @@ export function loadSettings({
   configPath = DEFAULT_SETTINGS_PATH,
   createIfMissing = true,
   requireSupabase = true,
+  requireTelegram = undefined,
   cwd = process.cwd(),
   home = homedir(),
 } = {}) {
@@ -400,10 +542,37 @@ export function loadSettings({
     );
   }
 
-  const settings = validateSettings(parsed, { requireSupabase, cwd, home });
+  const settings = validateSettings(parsed, {
+    requireSupabase,
+    requireTelegram,
+    cwd,
+    home,
+  });
   return {
     settings,
     path: resolvedPath,
     created,
   };
+}
+
+/**
+ * Persist settings JSON atomically with 0o600 permissions.
+ */
+export function saveSettings(
+  configPath = DEFAULT_SETTINGS_PATH,
+  rawSettings,
+  { cwd = process.cwd(), home = homedir() } = {},
+) {
+  const resolvedPath = expandHomePath(configPath, { cwd, home });
+  mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
+  writeFileSync(resolvedPath, `${JSON.stringify(rawSettings, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  try {
+    chmodSync(resolvedPath, 0o600);
+  } catch {
+    // Ignore chmod errors on filesystems without POSIX permissions
+  }
+  return resolvedPath;
 }

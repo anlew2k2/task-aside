@@ -172,7 +172,7 @@ test("HTTP and MCP expose create_task, get_task, and list_tasks with v1 envelope
   const listToolsJson = await listToolsRes.json();
   assert.deepEqual(
     listToolsJson.result.tools.map((tool) => tool.name),
-    ["create_task", "get_task", "list_tasks"],
+    ["create_task", "get_task", "list_tasks", "cancel_task", "retry_task"],
   );
 
   // MCP create_task, get_task, list_tasks
@@ -389,10 +389,165 @@ test("All transports disabled throws ConfigError", async (t) => {
         installSignalHandlers: false,
         taskRepository: createInMemoryTaskRepository(),
         settings: makeTestSettings(dir, {
-          transports: { http: false, mcp: false, worker: false },
+          transports: { http: false, mcp: false, worker: false, telegram: false },
         }),
         logger: createMemoryLogger(),
       }),
     (err) => err instanceof ConfigError,
   );
+});
+
+test("HTTP and MCP expose cancel and retry with 409 conflict handling", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-cancel-retry-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const taskRepository = createInMemoryTaskRepository();
+  const app = await startApp({
+    installSignalHandlers: false,
+    taskRepository,
+    settings: makeTestSettings(dir),
+    logger: createMemoryLogger(),
+  });
+  t.after(() => app.stop());
+
+  const createRes = await fetch(`${app.url}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      title: "Cancelable task",
+      description: "Body",
+      priority: "P1",
+      execution: { agent: "codex", effort: "low" },
+    }),
+  });
+  const created = await createRes.json();
+
+  // Retry while queued -> 409 Conflict
+  const activeRetryRes = await fetch(`${app.url}/tasks/${created.data.id}/retry`, {
+    method: "POST",
+  });
+  assert.equal(activeRetryRes.status, 409);
+
+  // Cancel queued -> 200 cancelled
+  const cancelRes = await fetch(`${app.url}/tasks/${created.data.id}/cancel`, {
+    method: "POST",
+  });
+  assert.equal(cancelRes.status, 200);
+  const cancelled = await cancelRes.json();
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.result.data.error.code, "CANCELLED");
+
+  // Second cancel -> 409 Conflict
+  const secondCancelRes = await fetch(`${app.url}/tasks/${created.data.id}/cancel`, {
+    method: "POST",
+  });
+  assert.equal(secondCancelRes.status, 409);
+
+  // HTTP retry cancelled -> 201 new queued task linked via parent_id
+  const retryRes = await fetch(`${app.url}/tasks/${created.data.id}/retry`, {
+    method: "POST",
+  });
+  assert.equal(retryRes.status, 201);
+  const retried = await retryRes.json();
+  assert.equal(retried.data.parent_id, created.data.id);
+  assert.equal(retried.data.title, "Cancelable task");
+
+  // MCP cancel_task and retry_task
+  const mcpCancelRes = await fetch(`${app.url}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: { name: "cancel_task", arguments: { id: retried.data.id } },
+    }),
+  });
+  const mcpCancelPayload = JSON.parse((await mcpCancelRes.json()).result.content[0].text);
+  assert.equal(mcpCancelPayload.status, "cancelled");
+
+  const mcpConflictRes = await fetch(`${app.url}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "cancel_task", arguments: { id: retried.data.id } },
+    }),
+  });
+  const mcpConflictRpc = await mcpConflictRes.json();
+  assert.equal(mcpConflictRpc.result.isError, true);
+
+  const mcpRetryRes = await fetch(`${app.url}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 12,
+      method: "tools/call",
+      params: { name: "retry_task", arguments: { id: retried.data.id } },
+    }),
+  });
+  const mcpRetried = JSON.parse((await mcpRetryRes.json()).result.content[0].text);
+  assert.equal(mcpRetried.data.parent_id, retried.data.id);
+});
+
+test("Cancelling a running task aborts worker process and preserves cancelled status", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-cancel-running-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const slowCodex = join(dir, "slow-codex.mjs");
+  writeFileSync(
+    slowCodex,
+    `#!/usr/bin/env node
+setInterval(() => {}, 1000);
+`,
+    "utf8",
+  );
+  chmodSync(slowCodex, 0o755);
+
+  const taskRepository = createInMemoryTaskRepository();
+  const app = await startApp({
+    installSignalHandlers: false,
+    taskRepository,
+    settings: makeTestSettings(dir, {
+      transports: { http: true, mcp: false, worker: true },
+      worker: {
+        allowed_agents: ["codex"],
+        agents: {
+          agy: { executable: "agy", default_model: null, default_effort: null },
+          claude: { executable: "claude", default_model: null, default_effort: null },
+          codex: { executable: slowCodex, default_model: null, default_effort: null, skip_git_repo_check: false },
+        },
+      },
+    }),
+    logger: createMemoryLogger(),
+  });
+  t.after(() => app.stop());
+
+  const created = await (
+    await fetch(`${app.url}/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "Running task to cancel",
+        description: "Cancel mid-flight",
+        priority: "P0",
+        execution: { agent: "codex" },
+      }),
+    })
+  ).json();
+
+  await waitFor(async () => (await taskRepository.findById(created.data.id))?.status === "running");
+
+  const cancelRes = await fetch(`${app.url}/tasks/${created.data.id}/cancel`, {
+    method: "POST",
+  });
+  assert.equal(cancelRes.status, 200);
+
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const finalRecord = await taskRepository.findById(created.data.id);
+  assert.equal(finalRecord.status, "cancelled");
+  assert.equal(finalRecord.result.data.error.code, "CANCELLED");
 });

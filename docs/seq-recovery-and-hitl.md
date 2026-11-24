@@ -1,21 +1,24 @@
 # Sequence: Recovery, Breakdown & HITL
 
-Covers task terminal states, failure and lease-expiry handling, graceful shutdown, subtask decomposition via `parent_id`, and session continuation via `session_id`.
+Covers task terminal states, failure, cancellation, retry, lease-expiry handling, graceful shutdown, subtask decomposition via `parent_id`, and session continuation via `session_id` or Telegram Reply-to-Resume.
 
 ## Task State Machine
 
 ```mermaid
 stateDiagram-v2
-  [*] --> queued: Created via HTTP or MCP
+  [*] --> queued: Created via HTTP, MCP, or Telegram
   queued --> running: Claimed by matching worker
+  queued --> cancelled: User cancel
   running --> completed: Agent exit 0 without reported error
   running --> failed: Policy rejection, spawn error, or non-zero exit
   running --> timeout: Outer execution timeout exceeded
   running --> interrupted: Worker shutdown signal or expired lease
+  running --> cancelled: User cancel (local or via heartbeat)
   completed --> [*]
   failed --> [*]
   timeout --> [*]
   interrupted --> [*]
+  cancelled --> [*]
 ```
 
 ## Subtask Breakdown & HITL Resume
@@ -24,28 +27,29 @@ stateDiagram-v2
 sequenceDiagram
   autonumber
   participant Parent as Parent Agent Run
-  participant MCP as "MCP Server (/mcp)"
+  participant Core as "HTTP / MCP / Telegram"
   participant DB as "Supabase tasks"
-  participant Client as "Human / Orchestrator"
+  participant Human as "Human / Orchestrator"
   participant Worker as Worker
 
   opt Task too large -> decompose
-    Parent->>MCP: Call create_task with parent_id = current task_id
-    MCP->>DB: Enqueue child task (status = queued)
+    Parent->>Core: Create child task with parent_id = current task_id
+    Core->>DB: Enqueue child task (status = queued)
   end
   Parent-->>DB: Complete run (persist session_id in result_envelope)
-  Client->>MCP: Call get_task to inspect result & open questions
-  Client->>MCP: Call create_task with parent_id and execution.session_id
-  Worker->>DB: Claim follow-up task
-  Worker->>Worker: Resume previous agent session using session_id
+  Human->>Core: Inspect result or swipe-reply in Telegram
+  Core->>Core: Parse UUID v7 from replied message & load original task
+  Core->>DB: Enqueue follow-up with parent_id + inherited execution & session_id
+  Worker->>DB: Claim follow-up task and resume previous agent session
 ```
 
-## Failure & Recovery Semantics
+## Failure, Cancel & Recovery Semantics
 
 | Scenario | Final Status | Replay Policy & Notes |
 | --- | --- | --- |
-| **Pre-spawn policy failure** | `failed` | Writes `result.json` with error category `permission` or `validation`; no retry |
-| **CLI non-zero / spawn error** | `failed` | Never blindly replayed after spawn to protect workspace from partial edits |
+| **Pre-spawn policy failure** | `failed` | Writes `result.json` with `permission` or `validation` error; no automatic retry |
+| **CLI non-zero / spawn error** | `failed` | Never auto-replayed after spawn; human-triggered `retry` creates a new linked task |
 | **Outer timeout exceeded** | `timeout` | Sends `SIGTERM` (5s `SIGKILL` fallback) and persists `EXECUTION_TIMEOUT` |
-| **Graceful shutdown (`SIGINT`/`SIGTERM`)** | `interrupted` | Aborts child process and persists `interrupted` without forwarding abort signal to DB write |
+| **Graceful shutdown (`SIGINT`/`SIGTERM`)** | `interrupted` | Aborts child process and persists `interrupted` without aborting DB write |
 | **Worker crash (lease expired)** | `interrupted` | Next `claim_next_task` call transitions stale `running` rows to `interrupted` (`LEASE_EXPIRED`) |
+| **Human cancellation / Retry** | `cancelled` | `cancel` aborts active run and locks status; `retry` creates a fresh child row via `parent_id` |

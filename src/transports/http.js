@@ -1,5 +1,10 @@
 import { createServer } from "node:http";
-import { NotFoundError, StorageError, ValidationError } from "#src/utilities/errors.js";
+import {
+  ConflictError,
+  NotFoundError,
+  StorageError,
+  ValidationError,
+} from "#src/utilities/errors.js";
 import { readJsonBody, sendEmpty, sendJson } from "#src/utilities/http.js";
 
 /**
@@ -22,6 +27,10 @@ export function createHttpTransport({
     }
     if (error instanceof NotFoundError) {
       sendJson(res, 404, { error: error.message, code: error.code });
+      return true;
+    }
+    if (error instanceof ConflictError) {
+      sendJson(res, 409, { error: error.message, code: error.code });
       return true;
     }
     if (error instanceof StorageError) {
@@ -107,6 +116,46 @@ export function createHttpTransport({
     }
   }
 
+  async function handleCancelTask(rawId, res) {
+    let id;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      sendJson(res, 400, { error: "Invalid task ID encoding", code: "VALIDATION_ERROR" });
+      return;
+    }
+
+    try {
+      const record = await taskHandler.cancelTask({ id });
+      sendJson(res, 200, record);
+    } catch (error) {
+      if (!handleTaskError(res, error)) {
+        throw error;
+      }
+    }
+  }
+
+  async function handleRetryTask(rawId, req, res) {
+    let id;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      sendJson(res, 400, { error: "Invalid task ID encoding", code: "VALIDATION_ERROR" });
+      return;
+    }
+
+    try {
+      const traceparent =
+        typeof req.headers.traceparent === "string" ? req.headers.traceparent : null;
+      const task = await taskHandler.retryTask({ id }, { traceparent });
+      sendJson(res, 201, task);
+    } catch (error) {
+      if (!handleTaskError(res, error)) {
+        throw error;
+      }
+    }
+  }
+
   function catchAsyncError(res, promise) {
     void promise.catch((error) => {
       logger.error(
@@ -160,6 +209,21 @@ export function createHttpTransport({
         return;
       }
       sendEmpty(res, 405, { allow: "GET, POST" });
+      return;
+    }
+
+    const taskActionMatch = /^\/tasks\/([^/]+)\/(cancel|retry)$/.exec(pathname);
+    if (taskActionMatch && enableHttp && taskHandler) {
+      if (req.method === "POST") {
+        const [, rawId, action] = taskActionMatch;
+        if (action === "cancel") {
+          catchAsyncError(res, handleCancelTask(rawId, res));
+        } else {
+          catchAsyncError(res, handleRetryTask(rawId, req, res));
+        }
+        return;
+      }
+      sendEmpty(res, 405, { allow: "POST" });
       return;
     }
 

@@ -18,6 +18,14 @@ export const TASK_STATUSES = Object.freeze([
   "failed",
   "timeout",
   "interrupted",
+  "cancelled",
+]);
+export const TERMINAL_TASK_STATUSES = Object.freeze([
+  "completed",
+  "failed",
+  "timeout",
+  "interrupted",
+  "cancelled",
 ]);
 
 const EXECUTION_ALLOWED_KEYS = new Set([
