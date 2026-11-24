@@ -41,5 +41,6 @@ flowchart LR
 | Document | Scope |
 | --- | --- |
 | [seq-task-intake.md](./seq-task-intake.md) | Creating, fetching, listing, cancelling, and retrying tasks over HTTP, MCP, and Telegram |
+| [seq-telegram.md](./seq-telegram.md) | One-time auth pairing, long-polling intake, Draft Cards, commands, callbacks, and result delivery |
 | [seq-worker-execution.md](./seq-worker-execution.md) | Polling, atomic claim, heartbeat, lifecycle events, CLI execution, and artifacts |
 | [seq-recovery-and-hitl.md](./seq-recovery-and-hitl.md) | State machine, cancel/retry, lease expiry, shutdown, subtask breakdown, and HITL resume |

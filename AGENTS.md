@@ -19,7 +19,7 @@ src/index.js  =   Composition root (wires dependencies via DI; no business logic
 
 ### Layer Responsibilities
 
-- `src/transports/` (`http.js`, `mcp.js`, `worker.js`): Protocol, HTTP/JSON-RPC parsing, and background polling loop. Transports may **only** call `handlers/` directly (and coordinate with sibling transports).
+- `src/transports/` (`http.js`, `mcp.js`, `telegram.js`, `worker.js`): Protocol, HTTP/JSON-RPC parsing, and background polling loop. Transports may **only** call `handlers/` directly (and coordinate with sibling transports).
 - `src/handlers/` (`task.handler.js`, `health.handler.js`): Transport-agnostic entry points and input validation. One handler can serve multiple transports (HTTP, MCP, Worker). Handlers may **only** call `usecases/` directly.
 - `src/usecases/` (`task.usecase.js`): Business logic and orchestration. Usecases may **only** call `services/` and `repositories/` directly.
 - `src/services/` (`agent.service.js`): Headless agent CLI dispatch (`agy`, `claude`, `codex`), prompt rendering, artifact capture, and result envelope normalization.
@@ -55,5 +55,6 @@ Keep `docs/` synchronized whenever architecture, protocols, or runtime behavior 
 | --- | --- |
 | Layers, transports, `settings.json`, `~/.task-aside/` layout, or DB schema overview | `docs/architecture.md` |
 | HTTP `/tasks` routes, MCP tools, intake validation, or envelope fields | `docs/seq-task-intake.md` |
+| Telegram auth pairing, long polling, Draft Cards, commands, callbacks, or notification delivery | `docs/seq-telegram.md` |
 | Worker polling, `claim_next_task` / `extend_task_lease`, agent dispatch, policy gates, or run artifacts | `docs/seq-worker-execution.md` |
 | Task statuses, error/timeout/shutdown/lease-expiry rules, `parent_id` breakdown, or `session_id` resume | `docs/seq-recovery-and-hitl.md` |

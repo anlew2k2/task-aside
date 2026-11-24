@@ -177,7 +177,7 @@ Built-in MCP tools:
 
 Telegram commands (when `transports.telegram` is enabled):
 
-- Plain text opens a 1-tap Draft Card to adjust agent, priority, or workspace before running
+- Plain text opens a 1-tap Draft Card to adjust agent or priority before running
 - Swipe-reply to any task card, completion notification, or `.md` attachment to resume or follow up
 - `/run <prompt>`, `/list [status]`, `/task <id>`, `/cancel <id>`, `/retry <id>`, `/use`, `/health`, `/help`
 
@@ -195,6 +195,7 @@ High-level architecture and sequence flows live in `docs/`:
 
 - [Architecture Overview](./docs/architecture.md)
 - [Task Intake & Queries](./docs/seq-task-intake.md)
+- [Telegram Pairing, Control & Notifications](./docs/seq-telegram.md)
 - [Worker Execution](./docs/seq-worker-execution.md)
 - [Recovery, Breakdown & HITL](./docs/seq-recovery-and-hitl.md)
 
@@ -207,7 +208,7 @@ bin/task-aside.js    CLI entrypoint
 docs/                High-level architecture and sequence docs
 migrations/          Supabase Postgres schema and RPC migrations
 src/index.js         Composition root (DI wiring)
-src/transports/      HTTP, MCP, and background worker transports
+src/transports/      HTTP, MCP, Telegram, and background worker transports
 src/handlers/        Transport-agnostic entry points
 src/usecases/        Business logic
 src/services/        Headless agent harness service (agy, claude, codex)
