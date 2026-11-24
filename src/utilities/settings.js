@@ -25,6 +25,7 @@ export function createDefaultSettings() {
       worker: true,
       telegram: false,
     },
+    allowed_workspaces: [],
     supabase: {
       url: "",
       publishable_key: "",
@@ -37,8 +38,6 @@ export function createDefaultSettings() {
       chat_id: null,
       default_agent: null,
       default_priority: "P1",
-      default_workspace: null,
-      workspaces: {},
       poll_timeout_seconds: 25,
       api_base_url: "https://api.telegram.org",
     },
@@ -54,8 +53,6 @@ export function createDefaultSettings() {
       allowed_agents: ["agy", "claude", "codex"],
       default_permission_mode: "workspace",
       max_permission_mode: "workspace",
-      default_cwd: "",
-      allowed_cwd_roots: [],
       default_timeout_ms: 600000,
       agents: {
         agy: {
@@ -170,6 +167,7 @@ export function validateSettings(
   {
     requireSupabase = true,
     requireTelegram = undefined,
+    requireAllowedWorkspaces = true,
     cwd = process.cwd(),
     home = homedir(),
   } = {},
@@ -178,7 +176,46 @@ export function validateSettings(
     throw new ConfigError("Settings root must be a JSON object");
   }
 
+  if (isPlainObject(rawSettings.worker) && "allowed_cwd_roots" in rawSettings.worker) {
+    throw new ConfigError(
+      "worker.allowed_cwd_roots has been replaced by top-level allowed_workspaces in settings.json",
+    );
+  }
+  if (isPlainObject(rawSettings.worker) && "default_cwd" in rawSettings.worker) {
+    throw new ConfigError(
+      "worker.default_cwd has been removed; configure top-level allowed_workspaces in settings.json instead",
+    );
+  }
+  if (
+    isPlainObject(rawSettings.telegram) &&
+    ("workspaces" in rawSettings.telegram || "default_workspace" in rawSettings.telegram)
+  ) {
+    throw new ConfigError(
+      "telegram.workspaces and telegram.default_workspace have been removed; configure top-level allowed_workspaces in settings.json instead",
+    );
+  }
+
   const merged = deepMerge(createDefaultSettings(), rawSettings);
+
+  // Allowed Workspaces
+  if (!Array.isArray(merged.allowed_workspaces)) {
+    throw new ConfigError("allowed_workspaces must be an array of directory paths");
+  }
+  const allowedWorkspaces = [];
+  for (const [idx, entry] of merged.allowed_workspaces.entries()) {
+    const resolved = expandHomePath(
+      assertNonEmptyConfigString(entry, `allowed_workspaces[${idx}]`),
+      { cwd, home },
+    );
+    if (!allowedWorkspaces.includes(resolved)) {
+      allowedWorkspaces.push(resolved);
+    }
+  }
+  if (requireAllowedWorkspaces && allowedWorkspaces.length === 0) {
+    throw new ConfigError(
+      'allowed_workspaces must contain at least one directory path in settings.json (use ["~"] for simplicity)',
+    );
+  }
 
   // Server
   if (!isPlainObject(merged.server)) {
@@ -313,22 +350,6 @@ export function validateSettings(
     );
   }
 
-  if (typeof w.default_cwd !== "string") {
-    throw new ConfigError("worker.default_cwd must be a string");
-  }
-  const defaultCwd =
-    w.default_cwd.trim() === "" ? cwd : expandHomePath(w.default_cwd, { cwd, home });
-
-  if (!Array.isArray(w.allowed_cwd_roots)) {
-    throw new ConfigError("worker.allowed_cwd_roots must be an array of paths");
-  }
-  const allowedCwdRoots = w.allowed_cwd_roots.map((root, idx) =>
-    expandHomePath(
-      assertNonEmptyConfigString(root, `worker.allowed_cwd_roots[${idx}]`),
-      { cwd, home },
-    ),
-  );
-
   const defaultTimeoutMs = assertPositiveConfigInt(
     w.default_timeout_ms,
     "worker.default_timeout_ms",
@@ -408,32 +429,6 @@ export function validateSettings(
     );
   }
 
-  if (!isPlainObject(tg.workspaces)) {
-    throw new ConfigError("telegram.workspaces must be an object");
-  }
-  const workspaces = {};
-  for (const [aliasKey, rawWorkspacePath] of Object.entries(tg.workspaces)) {
-    const alias = assertNonEmptyConfigString(aliasKey, "telegram.workspaces key");
-    if (alias in workspaces) {
-      throw new ConfigError(`Duplicate telegram.workspaces alias "${alias}"`);
-    }
-    const workspacePath = assertNonEmptyConfigString(
-      rawWorkspacePath,
-      `telegram.workspaces.${alias}`,
-    );
-    workspaces[alias] = expandHomePath(workspacePath, { cwd, home });
-  }
-
-  const tgDefaultWorkspace = assertNullableConfigString(
-    tg.default_workspace,
-    "telegram.default_workspace",
-  );
-  if (tgDefaultWorkspace !== null && !(tgDefaultWorkspace in workspaces)) {
-    throw new ConfigError(
-      `telegram.default_workspace "${tgDefaultWorkspace}" must match a key in telegram.workspaces`,
-    );
-  }
-
   const pollTimeoutSeconds = assertPositiveConfigInt(
     tg.poll_timeout_seconds,
     "telegram.poll_timeout_seconds",
@@ -457,6 +452,7 @@ export function validateSettings(
   return {
     server: { host, port },
     transports,
+    allowed_workspaces: allowedWorkspaces,
     supabase: {
       url: normalizedUrl,
       publishable_key: rawKey,
@@ -469,8 +465,6 @@ export function validateSettings(
       chat_id: tgChatId,
       default_agent: tgDefaultAgent,
       default_priority: tg.default_priority,
-      default_workspace: tgDefaultWorkspace,
-      workspaces,
       poll_timeout_seconds: pollTimeoutSeconds,
       api_base_url: apiBaseUrl,
     },
@@ -484,8 +478,6 @@ export function validateSettings(
       allowed_agents: allowedAgents,
       default_permission_mode: w.default_permission_mode,
       max_permission_mode: w.max_permission_mode,
-      default_cwd: defaultCwd,
-      allowed_cwd_roots: allowedCwdRoots,
       default_timeout_ms: defaultTimeoutMs,
       agents,
     },
@@ -501,6 +493,7 @@ export function loadSettings({
   createIfMissing = true,
   requireSupabase = true,
   requireTelegram = undefined,
+  requireAllowedWorkspaces = true,
   cwd = process.cwd(),
   home = homedir(),
 } = {}) {
@@ -545,6 +538,7 @@ export function loadSettings({
   const settings = validateSettings(parsed, {
     requireSupabase,
     requireTelegram,
+    requireAllowedWorkspaces,
     cwd,
     home,
   });

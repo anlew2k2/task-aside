@@ -31,7 +31,7 @@ sequenceDiagram
       end
     and Headless Execution
       U->>A: executeTask(input_envelope, signal)
-      A->>A: Enforce allowed_agents, max_permission_mode, allowed_cwd_roots
+      A->>A: Enforce allowed_agents, max_permission_mode, allowed_workspaces
       A->>CLI: Spawn non-interactive process & stream artifacts to runs/
       CLI-->>A: Exit code + native JSON/JSONL output
       A-->>U: status + v1 task_result envelope
@@ -46,6 +46,6 @@ sequenceDiagram
 | Aspect | Behavior |
 | --- | --- |
 | **Scheduling order** | `claim_next_task` uses `FOR UPDATE SKIP LOCKED`, filtering by `allowed_agents` and ordering by `priority` (`P0` first) then `created_at` |
-| **Policy gates** | Pre-spawn checks reject disallowed agents, `permission_mode` above `max_permission_mode`, missing `cwd`, or `cwd` outside `allowed_cwd_roots` |
+| **Policy gates** | Pre-spawn checks reject disallowed agents, `permission_mode` above `max_permission_mode`, missing `cwd`, or `cwd` outside `allowed_workspaces` |
 | **Remote cancellation** | `finishTask` guards `status = running`, and heartbeat loss aborts the running child so `cancelled` is never overwritten with `interrupted` |
 | **Telegram delivery** | Short Markdown renders inline; outputs above ~3200 chars send an excerpt plus an attached `.md` document containing the task UUID |

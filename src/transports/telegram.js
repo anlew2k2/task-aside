@@ -12,7 +12,7 @@ export const TELEGRAM_BOT_COMMANDS = Object.freeze([
   { command: "task", description: "Inspect task details by ID" },
   { command: "cancel", description: "Cancel a queued or running task" },
   { command: "retry", description: "Retry a finished or failed task" },
-  { command: "use", description: "Switch active agent, priority, or workspace" },
+  { command: "use", description: "Switch active agent or priority" },
   { command: "health", description: "Check worker and queue status" },
   { command: "help", description: "Show usage instructions" },
 ]);
@@ -170,15 +170,6 @@ function cycleNext(items, current) {
   return items[(idx + 1) % items.length];
 }
 
-function cycleWorkspace(workspaceNames, current) {
-  const options = [null, ...workspaceNames];
-  const idx = options.indexOf(current ?? null);
-  if (idx === -1) {
-    return options[0];
-  }
-  return options[(idx + 1) % options.length];
-}
-
 function formatDurationMs(durationMs) {
   if (typeof durationMs !== "number" || !Number.isFinite(durationMs)) {
     return null;
@@ -199,6 +190,7 @@ export function createTelegramTransport({
   healthHandler,
   telegramConfig,
   workerConfig,
+  allowedWorkspaces = [],
   getWorkerStatus,
   transports,
   fetchImpl = globalThis.fetch,
@@ -214,8 +206,6 @@ export function createTelegramTransport({
   const pollTimeoutSeconds = telegramConfig.poll_timeout_seconds ?? 25;
   const authorizedUserId = telegramConfig.user_id ? String(telegramConfig.user_id) : null;
   const authorizedChatId = telegramConfig.chat_id ? String(telegramConfig.chat_id) : null;
-  const workspaces = telegramConfig.workspaces ?? {};
-  const workspaceNames = Object.keys(workspaces);
   const availableAgents =
     Array.isArray(workerConfig?.allowed_agents) && workerConfig.allowed_agents.length > 0
       ? workerConfig.allowed_agents
@@ -226,7 +216,6 @@ export function createTelegramTransport({
       ? telegramConfig.default_agent
       : availableAgents[0],
     priority: telegramConfig.default_priority ?? "P1",
-    workspace: telegramConfig.default_workspace ?? null,
   };
 
   const drafts = new Map();
@@ -356,26 +345,11 @@ export function createTelegramTransport({
     }
   }
 
-  function resolveWorkspaceCwd(workspaceAlias) {
-    if (workspaceAlias && workspaceAlias in workspaces) {
-      return workspaces[workspaceAlias];
-    }
-    return workerConfig?.default_cwd || null;
-  }
-
-  function formatWorkspaceLabel(workspaceAlias) {
-    if (workspaceAlias && workspaceAlias in workspaces) {
-      return `${workspaceAlias} (${workspaces[workspaceAlias]})`;
-    }
-    return workerConfig?.default_cwd ? `default (${workerConfig.default_cwd})` : "default";
-  }
-
   function buildDraftCard(draft) {
     const lines = [
       "<b>📝 New Task Draft</b>",
       `<b>Title:</b> ${escapeHtml(draft.title)}`,
       `<b>Agent:</b> <code>${escapeHtml(draft.agent)}</code> | <b>Priority:</b> <code>${escapeHtml(draft.priority)}</code>`,
-      `<b>Workspace:</b> <code>${escapeHtml(formatWorkspaceLabel(draft.workspace))}</code>`,
       "",
       `<pre>${escapeHtml(truncateText(draft.prompt, 1200))}</pre>`,
     ];
@@ -384,12 +358,6 @@ export function createTelegramTransport({
       { text: `Agent: ${draft.agent}`, callback_data: `d:ag:${draft.id}` },
       { text: `Prio: ${draft.priority}`, callback_data: `d:pr:${draft.id}` },
     ];
-    if (workspaceNames.length > 0) {
-      row2.push({
-        text: `WS: ${draft.workspace ?? "default"}`,
-        callback_data: `d:ws:${draft.id}`,
-      });
-    }
 
     return {
       text: lines.join("\n"),
@@ -431,7 +399,7 @@ export function createTelegramTransport({
     const title = taskData.title ?? "Untitled task";
     const agent = isRecord ? recordOrEnvelope.agent : exec.agent;
     const priority = isRecord ? recordOrEnvelope.priority : taskData.priority;
-    const cwd = resultData?.execution?.cwd ?? exec.cwd ?? workerConfig?.default_cwd ?? null;
+    const cwd = resultData?.execution?.cwd ?? exec.cwd ?? allowedWorkspaces[0] ?? null;
     const duration = formatDurationMs(resultData?.execution?.duration_ms);
     const sessionId = resultData?.execution?.session_id ?? exec.session_id ?? null;
     const errorMsg = resultData?.error?.message ?? null;
@@ -468,19 +436,12 @@ export function createTelegramTransport({
       "<b>⚙️ Active Telegram Defaults</b>",
       `<b>Agent:</b> <code>${escapeHtml(activeDefaults.agent)}</code>`,
       `<b>Priority:</b> <code>${escapeHtml(activeDefaults.priority)}</code>`,
-      `<b>Workspace:</b> <code>${escapeHtml(formatWorkspaceLabel(activeDefaults.workspace))}</code>`,
     ];
 
     const buttons = [
       { text: `Agent: ${activeDefaults.agent}`, callback_data: "u:ag" },
       { text: `Prio: ${activeDefaults.priority}`, callback_data: "u:pr" },
     ];
-    if (workspaceNames.length > 0) {
-      buttons.push({
-        text: `WS: ${activeDefaults.workspace ?? "default"}`,
-        callback_data: "u:ws",
-      });
-    }
 
     return {
       text: lines.join("\n"),
@@ -702,7 +663,7 @@ export function createTelegramTransport({
           "• <code>/task &lt;id&gt;</code> — inspect task details.",
           "• <code>/cancel &lt;id&gt;</code> — cancel queued/running task.",
           "• <code>/retry &lt;id&gt;</code> — retry a finished/failed task.",
-          "• <code>/use</code> — switch active agent, priority, or workspace.",
+          "• <code>/use</code> — switch active agent or priority.",
           "• <code>/health</code> — worker and queue status.",
         ];
         await sendMessage({ chatId, text: helpLines.join("\n") });
@@ -746,7 +707,7 @@ export function createTelegramTransport({
           priority: activeDefaults.priority,
           execution: {
             agent: activeDefaults.agent,
-            cwd: resolveWorkspaceCwd(activeDefaults.workspace),
+            cwd: null,
           },
           replyToMessageId: messageId,
         });
@@ -872,7 +833,7 @@ export function createTelegramTransport({
         agent: origExec.agent ?? original.agent,
         model: origExec.model ?? null,
         effort: origExec.effort ?? null,
-        cwd: origExec.cwd ?? null,
+        cwd: original.result?.data?.execution?.cwd ?? origExec.cwd ?? null,
         permission_mode: origExec.permission_mode ?? null,
         timeout_ms: origExec.timeout_ms ?? null,
         session_id: sessionId,
@@ -915,7 +876,6 @@ export function createTelegramTransport({
         title: buildTitle(text),
         agent: activeDefaults.agent,
         priority: activeDefaults.priority,
-        workspace: activeDefaults.workspace,
         createdAt: Date.now(),
       };
       setBoundedMap(drafts, draftId, draft, MAX_DRAFTS);
@@ -971,8 +931,6 @@ export function createTelegramTransport({
           draft.agent = cycleNext(availableAgents, draft.agent);
         } else if (action === "pr") {
           draft.priority = cycleNext(TASK_PRIORITIES, draft.priority);
-        } else if (action === "ws") {
-          draft.workspace = cycleWorkspace(workspaceNames, draft.workspace);
         } else if (action === "run") {
           drafts.delete(draftId);
           const taskEnvelope = await taskHandler.createTask({
@@ -981,7 +939,7 @@ export function createTelegramTransport({
             priority: draft.priority,
             execution: {
               agent: draft.agent,
-              cwd: resolveWorkspaceCwd(draft.workspace),
+              cwd: null,
             },
           });
           const taskId = taskEnvelope.data.id;
@@ -1020,8 +978,6 @@ export function createTelegramTransport({
           activeDefaults.agent = cycleNext(availableAgents, activeDefaults.agent);
         } else if (field === "pr") {
           activeDefaults.priority = cycleNext(TASK_PRIORITIES, activeDefaults.priority);
-        } else if (field === "ws") {
-          activeDefaults.workspace = cycleWorkspace(workspaceNames, activeDefaults.workspace);
         }
         const view = buildDefaultsMessage();
         await editMessageText({

@@ -12,6 +12,7 @@ export function createTaskUsecase({
   agentService = null,
   executeTask = null,
   workerConfig,
+  allowedWorkspaces = [],
   now = () => Date.now(),
   generateId = generateUuidV7,
   createTrace = createTraceContext,
@@ -108,7 +109,7 @@ export function createTaskUsecase({
           requested_model: execReq.model ?? null,
           effective_model: null,
           effort: execReq.effort ?? null,
-          cwd: execReq.cwd ?? workerConfig.default_cwd ?? null,
+          cwd: execReq.cwd ?? allowedWorkspaces[0] ?? null,
           permission_mode: execReq.permission_mode ?? workerConfig.default_permission_mode ?? null,
           enforcement: null,
           session_id: execReq.session_id ?? null,
@@ -201,6 +202,7 @@ export function createTaskUsecase({
       ...repoStats,
       workerId: workerConfig.worker_id,
       allowedAgents: workerConfig.allowed_agents,
+      allowedWorkspaces,
     };
   }
 

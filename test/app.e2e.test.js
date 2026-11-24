@@ -38,6 +38,7 @@ function makeTestSettings(dir, overrides = {}) {
   return {
     server: { host: "127.0.0.1", port: 0 },
     transports: { http: true, mcp: true, worker: false },
+    allowed_workspaces: [dir],
     supabase: { url: "", publishable_key: "", schema: "public", table: "tasks" },
     logging: { dir: join(dir, "logs") },
     worker: {
@@ -49,8 +50,6 @@ function makeTestSettings(dir, overrides = {}) {
       allowed_agents: ["agy", "claude", "codex"],
       default_permission_mode: "workspace",
       max_permission_mode: "workspace",
-      default_cwd: dir,
-      allowed_cwd_roots: [],
       default_timeout_ms: 5_000,
       ...overrides.worker,
     },
@@ -550,4 +549,53 @@ setInterval(() => {}, 1000);
   const finalRecord = await taskRepository.findById(created.data.id);
   assert.equal(finalRecord.status, "cancelled");
   assert.equal(finalRecord.result.data.error.code, "CANCELLED");
+});
+
+test("startApp prompts for allowed_workspaces when empty and persists them to settings.json", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "task-aside-e2e-ws-prompt-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const configPath = join(dir, "settings.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      server: { host: "127.0.0.1", port: 0 },
+      transports: { http: true, mcp: false, worker: false, telegram: false },
+      allowed_workspaces: [],
+      logging: { dir: join(dir, "logs") },
+      worker: { runs_dir: join(dir, "runs") },
+    }),
+    "utf8",
+  );
+
+  // Without prompter, empty allowed_workspaces fails startup with ConfigError
+  await assert.rejects(
+    () =>
+      startApp({
+        installSignalHandlers: false,
+        configPath,
+        taskRepository: createInMemoryTaskRepository(),
+        logger: createMemoryLogger(),
+      }),
+    (err) => err instanceof ConfigError && /allowed_workspaces/.test(err.message),
+  );
+
+  let prompted = false;
+  const app = await startApp({
+    installSignalHandlers: false,
+    configPath,
+    taskRepository: createInMemoryTaskRepository(),
+    logger: createMemoryLogger(),
+    promptAllowedWorkspaces: async () => {
+      prompted = true;
+      return [dir];
+    },
+  });
+  t.after(() => app.stop());
+
+  assert.equal(prompted, true);
+  assert.ok(app.allowedWorkspaces.length === 1);
+  const { loadSettings } = await import("#src/utilities/settings.js");
+  const reloaded = loadSettings({ configPath, requireSupabase: false });
+  assert.deepEqual(reloaded.settings.allowed_workspaces, [app.allowedWorkspaces[0]]);
 });

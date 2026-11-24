@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -186,8 +186,6 @@ test("createAgentService executes agy, claude, and codex fakes and writes artifa
       allowed_agents: ["agy", "claude", "codex"],
       default_permission_mode: "workspace",
       max_permission_mode: "workspace",
-      default_cwd: repoDir,
-      allowed_cwd_roots: [repoDir],
       default_timeout_ms: 10_000,
       agents: {
         agy: { executable: fakeAgy, default_model: null, default_effort: null },
@@ -195,6 +193,7 @@ test("createAgentService executes agy, claude, and codex fakes and writes artifa
         codex: { executable: fakeCodex, default_model: null, default_effort: null, skip_git_repo_check: true },
       },
     },
+    allowedWorkspaces: [repoDir],
     logger: { log() {}, error() {} },
   });
 
@@ -210,6 +209,7 @@ test("createAgentService executes agy, claude, and codex fakes and writes artifa
   assert.equal(agyRes.resultEnvelope.data.output.text, "# Agy Done\nAll good.");
   assert.equal(existsSync(agyRes.resultEnvelope.data.artifacts.result_file), true);
   assert.equal(existsSync(agyRes.resultEnvelope.data.artifacts.prompt_file), true);
+  assert.match(readFileSync(agyRes.resultEnvelope.data.artifacts.prompt_file, "utf8"), /Workspace Boundary:/);
   assert.match(readFileSync(agyRes.resultEnvelope.data.artifacts.log_file, "utf8"), /agy stderr/);
 
   const claudeRes = await service.executeTask(
@@ -230,15 +230,29 @@ test("createAgentService executes agy, claude, and codex fakes and writes artifa
   assert.match(codexRes.resultEnvelope.data.artifacts.raw_output_file, /events\.jsonl$/);
 });
 
-test("createAgentService handles policy rejections, non-zero exit, timeout, and AbortSignal", async (t) => {
+test("createAgentService handles policy rejections, subdirectories, symlinks, non-zero exit, timeout, and AbortSignal", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "task-aside-agent-fail-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
   const allowedRoot = join(dir, "allowed");
+  const nestedAllowedDir = join(allowedRoot, "apps", "web");
   const outsideDir = join(dir, "outside");
+  const escapedLink = join(allowedRoot, "escape-link");
   const runsDir = join(dir, "runs");
-  mkdirSync(allowedRoot, { recursive: true });
+  mkdirSync(nestedAllowedDir, { recursive: true });
   mkdirSync(outsideDir, { recursive: true });
+  symlinkSync(outsideDir, escapedLink);
+
+  const okCli = makeFakeCli(
+    dir,
+    "ok-cli.mjs",
+    `
+    process.stdin.resume();
+    process.stdin.on("end", () => {
+      process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "ok" }));
+    });
+    `,
+  );
 
   const failCli = makeFakeCli(
     dir,
@@ -261,23 +275,45 @@ test("createAgentService handles policy rejections, non-zero exit, timeout, and 
     workerConfig: {
       worker_id: "test-worker",
       runs_dir: runsDir,
-      allowed_agents: ["claude", "codex"],
+      allowed_agents: ["agy", "claude", "codex"],
       default_permission_mode: "workspace",
       max_permission_mode: "workspace",
-      default_cwd: allowedRoot,
-      allowed_cwd_roots: [allowedRoot],
       default_timeout_ms: 5_000,
       agents: {
-        agy: { executable: "agy", default_model: null, default_effort: null },
+        agy: { executable: okCli, default_model: null, default_effort: null },
         claude: { executable: failCli, default_model: null, default_effort: null },
         codex: { executable: slowCli, default_model: null, default_effort: null, skip_git_repo_check: true },
       },
     },
+    allowedWorkspaces: [allowedRoot],
     logger: { log() {}, error() {} },
   });
 
+  // 0. Subdirectory inside allowed parent folder is permitted
+  const nestedAllowed = await service.executeTask(
+    makeTaskEnvelope({ execution: { agent: "agy", cwd: nestedAllowedDir } }),
+  );
+  assert.equal(nestedAllowed.status, "completed");
+
   // 1. Disallowed agent
-  const notAllowed = await service.executeTask(
+  const restrictedAgentService = createAgentService({
+    workerConfig: {
+      worker_id: "test-worker",
+      runs_dir: runsDir,
+      allowed_agents: ["claude", "codex"],
+      default_permission_mode: "workspace",
+      max_permission_mode: "workspace",
+      default_timeout_ms: 5_000,
+      agents: {
+        agy: { executable: okCli, default_model: null, default_effort: null },
+        claude: { executable: failCli, default_model: null, default_effort: null },
+        codex: { executable: slowCli, default_model: null, default_effort: null, skip_git_repo_check: true },
+      },
+    },
+    allowedWorkspaces: [allowedRoot],
+    logger: { log() {}, error() {} },
+  });
+  const notAllowed = await restrictedAgentService.executeTask(
     makeTaskEnvelope({ execution: { agent: "agy" } }),
   );
   assert.equal(notAllowed.status, "failed");
@@ -291,12 +327,43 @@ test("createAgentService handles policy rejections, non-zero exit, timeout, and 
   assert.equal(permExceeded.status, "failed");
   assert.equal(permExceeded.resultEnvelope.data.error.code, "PERMISSION_EXCEEDED");
 
-  // 3. CWD outside allowed_cwd_roots
+  // 3a. CWD outside allowed_workspaces
   const cwdBlocked = await service.executeTask(
     makeTaskEnvelope({ execution: { agent: "claude", cwd: outsideDir } }),
   );
   assert.equal(cwdBlocked.status, "failed");
   assert.equal(cwdBlocked.resultEnvelope.data.error.code, "CWD_NOT_ALLOWED");
+
+  // 3b. Symlink inside allowed folder pointing outside is blocked
+  const symlinkBlocked = await service.executeTask(
+    makeTaskEnvelope({ execution: { agent: "claude", cwd: escapedLink } }),
+  );
+  assert.equal(symlinkBlocked.status, "failed");
+  assert.equal(symlinkBlocked.resultEnvelope.data.error.code, "CWD_NOT_ALLOWED");
+
+  // 3c. Empty allowedWorkspaces fails closed
+  const emptyWorkspaceService = createAgentService({
+    workerConfig: {
+      worker_id: "test-worker",
+      runs_dir: runsDir,
+      allowed_agents: ["claude"],
+      default_permission_mode: "workspace",
+      max_permission_mode: "workspace",
+      default_timeout_ms: 5_000,
+      agents: {
+        agy: { executable: okCli, default_model: null, default_effort: null },
+        claude: { executable: failCli, default_model: null, default_effort: null },
+        codex: { executable: slowCli, default_model: null, default_effort: null, skip_git_repo_check: true },
+      },
+    },
+    allowedWorkspaces: [],
+    logger: { log() {}, error() {} },
+  });
+  const emptyWsBlocked = await emptyWorkspaceService.executeTask(
+    makeTaskEnvelope({ execution: { agent: "claude", cwd: allowedRoot } }),
+  );
+  assert.equal(emptyWsBlocked.status, "failed");
+  assert.equal(emptyWsBlocked.resultEnvelope.data.error.code, "CWD_NOT_ALLOWED");
 
   // 4. Non-zero exit
   const nonZero = await service.executeTask(

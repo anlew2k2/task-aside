@@ -266,6 +266,7 @@ test("Telegram transport enforces user_id + chat_id, handles Draft Card, worker 
     settings: {
       server: { host: "127.0.0.1", port: 0 },
       transports: { http: true, mcp: true, worker: true, telegram: true },
+      allowed_workspaces: [dir],
       supabase: { url: "", publishable_key: "", schema: "public", table: "tasks" },
       telegram: {
         bot_token: "test-bot-token-secret",
@@ -273,8 +274,6 @@ test("Telegram transport enforces user_id + chat_id, handles Draft Card, worker 
         chat_id: 1001,
         default_agent: "codex",
         default_priority: "P1",
-        default_workspace: null,
-        workspaces: { alpha: dir },
         poll_timeout_seconds: 1,
         api_base_url: mockTg.url,
       },
@@ -288,8 +287,6 @@ test("Telegram transport enforces user_id + chat_id, handles Draft Card, worker 
         allowed_agents: ["codex", "claude"],
         default_permission_mode: "workspace",
         max_permission_mode: "workspace",
-        default_cwd: dir,
-        allowed_cwd_roots: [],
         default_timeout_ms: 5000,
         agents: {
           agy: { executable: "agy", default_model: null, default_effort: null },
@@ -307,7 +304,7 @@ test("Telegram transport enforces user_id + chat_id, handles Draft Card, worker 
   await new Promise((r) => setTimeout(r, 80));
   assert.equal(mockTg.calls.filter((c) => c.method === "sendMessage").length, 0);
 
-  // 2. Authorized user_id + chat_id creates Draft Card -> cycle agent, priority, workspace -> Run
+  // 2. Authorized user_id + chat_id creates Draft Card -> cycle agent, priority -> Run
   mockTg.pushMessage({ chatId: 1001, userId: 2002, text: "Audit repo authentication\nCheck edge cases" });
   await waitFor(() => mockTg.calls.some((c) => c.method === "sendMessage" && c.body.text.includes("New Task Draft")));
 
@@ -320,14 +317,12 @@ test("Telegram transport enforces user_id + chat_id, handles Draft Card, worker 
 
   mockTg.pushCallback({ chatId: 1001, userId: 2002, messageId: draftMsgId, data: `d:ag:${draftId}` });
   mockTg.pushCallback({ chatId: 1001, userId: 2002, messageId: draftMsgId, data: `d:pr:${draftId}` });
-  mockTg.pushCallback({ chatId: 1001, userId: 2002, messageId: draftMsgId, data: `d:ws:${draftId}` });
   await waitFor(() =>
     mockTg.calls.some(
       (c) =>
         c.method === "editMessageText" &&
         c.body.text.includes("claude") &&
-        c.body.text.includes("P2") &&
-        c.body.text.includes("alpha"),
+        c.body.text.includes("P2"),
     ),
   );
 
@@ -423,6 +418,7 @@ test("Telegram sends .md attachment for long outputs and supports restart-safe R
   const baseSettings = {
     server: { host: "127.0.0.1", port: 0 },
     transports: { http: false, mcp: false, worker: true, telegram: true },
+    allowed_workspaces: [dir],
     supabase: { url: "", publishable_key: "", schema: "public", table: "tasks" },
     telegram: {
       bot_token: "test-bot-token-long",
@@ -430,8 +426,6 @@ test("Telegram sends .md attachment for long outputs and supports restart-safe R
       chat_id: 1001,
       default_agent: "codex",
       default_priority: "P1",
-      default_workspace: null,
-      workspaces: {},
       poll_timeout_seconds: 1,
       api_base_url: mockTg.url,
     },
@@ -445,8 +439,6 @@ test("Telegram sends .md attachment for long outputs and supports restart-safe R
       allowed_agents: ["codex"],
       default_permission_mode: "workspace",
       max_permission_mode: "workspace",
-      default_cwd: dir,
-      allowed_cwd_roots: [],
       default_timeout_ms: 5000,
       agents: {
         agy: { executable: "agy", default_model: null, default_effort: null },
@@ -501,7 +493,7 @@ test("Telegram sends .md attachment for long outputs and supports restart-safe R
   const [followUp] = await taskRepository.findAll({ parent_id: originalTask.id });
   assert.equal(followUp.parent_id, originalTask.id);
   assert.equal(followUp.agent, "codex");
-  assert.equal(followUp.task.data.execution.cwd, dir);
+  assert.equal(followUp.task.data.execution.cwd, originalTask.result.data.execution.cwd);
   assert.equal(followUp.task.data.execution.session_id, "sess-long-99");
   assert.equal(followUp.task.data.description, "Now summarize the findings in 3 bullets");
 });
@@ -521,7 +513,6 @@ test("authTelegram pairs user_id + chat_id via /auth <token>, sets commands, and
       telegram: {
         bot_token: "test-pair-token",
         api_base_url: mockTg.url,
-        workspaces: { repo: "~/work/repo" },
       },
     }),
     "utf8",
@@ -552,9 +543,12 @@ test("authTelegram pairs user_id + chat_id via /auth <token>, sets commands, and
   assert.equal(savedRaw.transports.telegram, true);
   assert.equal(savedRaw.telegram.user_id, "4444");
   assert.equal(savedRaw.telegram.chat_id, "3333");
-  assert.equal(savedRaw.telegram.workspaces.repo, "~/work/repo");
 
-  const { settings } = loadSettings({ configPath, requireSupabase: false });
+  const { settings } = loadSettings({
+    configPath,
+    requireSupabase: false,
+    requireAllowedWorkspaces: false,
+  });
   assert.equal(settings.transports.telegram, true);
   assert.equal(settings.telegram.user_id, "4444");
   assert.equal(settings.telegram.chat_id, "3333");

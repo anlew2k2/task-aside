@@ -33,6 +33,7 @@ export async function startApp({
   enableTelegram = undefined,
   telegramFetch = undefined,
   startWorker = undefined,
+  promptAllowedWorkspaces = undefined,
 } = {}) {
   const appInfo = getPackageInfo();
 
@@ -46,14 +47,39 @@ export async function startApp({
       requireTelegram: enableTelegram,
     });
   } else {
-    const loaded = loadSettings({
+    let loaded = loadSettings({
       configPath,
-      requireSupabase: !taskRepository,
-      requireTelegram: enableTelegram,
+      requireSupabase: promptAllowedWorkspaces ? false : !taskRepository,
+      requireTelegram: promptAllowedWorkspaces ? false : enableTelegram,
+      requireAllowedWorkspaces: !promptAllowedWorkspaces,
     });
+    const firstCreated = loaded.created;
+
+    if (promptAllowedWorkspaces) {
+      if (loaded.settings.allowed_workspaces.length === 0) {
+        const entries = await promptAllowedWorkspaces({ settingsPath: loaded.path });
+        const normalizedEntries = Array.isArray(entries)
+          ? entries.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+          : [];
+        if (normalizedEntries.length > 0) {
+          const rawSettings = JSON.parse(readFileSync(loaded.path, "utf8"));
+          rawSettings.allowed_workspaces = normalizedEntries;
+          saveSettings(loaded.path, rawSettings);
+        }
+      }
+
+      loaded = loadSettings({
+        configPath: loaded.path,
+        createIfMissing: false,
+        requireSupabase: !taskRepository,
+        requireTelegram: enableTelegram,
+        requireAllowedWorkspaces: true,
+      });
+    }
+
     resolvedSettings = loaded.settings;
     settingsPath = loaded.path;
-    settingsCreated = loaded.created;
+    settingsCreated = firstCreated;
   }
 
   const resolvedEnableHttp = enableHttp ?? resolvedSettings.transports.http;
@@ -101,6 +127,7 @@ export async function startApp({
     agentService ??
     createAgentService({
       workerConfig: resolvedSettings.worker,
+      allowedWorkspaces: resolvedSettings.allowed_workspaces,
       logger: resolvedLogger,
     });
 
@@ -109,6 +136,7 @@ export async function startApp({
     agentService: resolvedAgentService,
     executeTask,
     workerConfig: resolvedSettings.worker,
+    allowedWorkspaces: resolvedSettings.allowed_workspaces,
     logger: resolvedLogger,
   });
 
@@ -150,6 +178,7 @@ export async function startApp({
         healthHandler,
         telegramConfig: resolvedSettings.telegram,
         workerConfig: resolvedSettings.worker,
+        allowedWorkspaces: resolvedSettings.allowed_workspaces,
         getWorkerStatus,
         transports,
         ...(telegramFetch ? { fetchImpl: telegramFetch } : {}),
@@ -200,6 +229,7 @@ export async function startApp({
     `Telegram: ${resolvedEnableTelegram ? `running (chat=${resolvedSettings.telegram.chat_id})` : "disabled"}`,
   );
   resolvedLogger.log(`Agents:   ${resolvedSettings.worker.allowed_agents.join(", ")}`);
+  resolvedLogger.log(`Workspaces: ${resolvedSettings.allowed_workspaces.join(", ")}`);
   resolvedLogger.log(`Runs:     ${resolvedSettings.worker.runs_dir}`);
   if (ownsLogger && resolvedLogger.getCurrentLogFile) {
     resolvedLogger.log(`Logs:     ${resolvedLogger.getCurrentLogFile()}`);
@@ -245,6 +275,7 @@ export async function startApp({
     settingsPath,
     logDir,
     runsDir: resolvedSettings.worker.runs_dir,
+    allowedWorkspaces: resolvedSettings.allowed_workspaces,
     transports,
     workerTransport,
     telegramTransport,
@@ -270,6 +301,7 @@ export async function authTelegram({
     configPath,
     requireSupabase: false,
     requireTelegram: false,
+    requireAllowedWorkspaces: false,
   });
 
   if (!settings.telegram.bot_token) {
@@ -311,6 +343,7 @@ export async function authTelegram({
     configPath: settingsPath,
     requireSupabase: false,
     requireTelegram: true,
+    requireAllowedWorkspaces: false,
   });
 
   logger.log(

@@ -33,8 +33,8 @@ flowchart LR
 
 - **Input Envelope (`v1`)**: Carries `schema`, OTel `metadata` (`trace_id`, `span_id`, timestamps), and `data` (`id`, `title`, `description`, `parent_id`, `priority`, and client-selected `execution` config).
 - **Result Envelope (`v1` / `task_result`)**: Mirrors the input envelope shape with propagated `trace_id` and `parent_span_id`, plus `status`, effective `execution` details, Markdown `output`, token/cost `usage`, local `artifacts` paths, and structured `error`.
-- **Telegram Settings**: Configured via `transports.telegram` and `telegram` (`bot_token`, `user_id`, `chat_id` paired via `task-aside auth telegram`, defaults, named `workspaces` aliases, polling timeout); Core and `public.tasks` store zero Telegram state.
-- **Worker Policies**: Enforced per worker via `allowed_agents`, `default_permission_mode`, `max_permission_mode`, `allowed_cwd_roots`, and `default_timeout_ms`.
+- **Telegram Settings**: Configured via `transports.telegram` and `telegram` (`bot_token`, `user_id`, `chat_id` paired via `task-aside auth telegram`, defaults, polling timeout); Core and `public.tasks` store zero Telegram state.
+- **Workspace & Worker Policies**: Top-level `allowed_workspaces` (required non-empty root directory list; subdirectories are permitted) restricts execution `cwd` globally, while worker policies enforce `allowed_agents`, `default_permission_mode`, `max_permission_mode`, and `default_timeout_ms`.
 
 ## Sequence Flows
 

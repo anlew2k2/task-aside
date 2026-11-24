@@ -20,6 +20,7 @@ test("loadSettings creates default settings.json with 0600 mode when missing", (
     configPath,
     createIfMissing: true,
     requireSupabase: false,
+    requireAllowedWorkspaces: false,
     home: dir,
     cwd: dir,
   });
@@ -29,7 +30,11 @@ test("loadSettings creates default settings.json with 0600 mode when missing", (
   assert.equal(settings.server.port, 3100);
   assert.equal(settings.logging.dir, join(dir, ".task-aside", "logs"));
   assert.equal(settings.worker.runs_dir, join(dir, ".task-aside", "runs"));
-  assert.equal(settings.worker.default_cwd, dir);
+  assert.deepEqual(settings.allowed_workspaces, []);
+  assert.equal("default_cwd" in settings.worker, false);
+  assert.equal("allowed_cwd_roots" in settings.worker, false);
+  assert.equal("workspaces" in settings.telegram, false);
+  assert.equal("default_workspace" in settings.telegram, false);
   assert.equal(settings.transports.telegram, false);
   assert.equal(settings.telegram.default_agent, "agy");
   assert.equal(settings.telegram.default_priority, "P1");
@@ -47,7 +52,7 @@ test("loadSettings creates default settings.json with 0600 mode when missing", (
   assert.deepEqual(written, createDefaultSettings());
 });
 
-test("loadSettings merges partial JSON, expands ~ paths, and validates fields", (t) => {
+test("loadSettings merges partial JSON, expands ~ paths, deduplicates allowed_workspaces, and validates fields", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "task-aside-settings-merge-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -56,13 +61,13 @@ test("loadSettings merges partial JSON, expands ~ paths, and validates fields", 
     configPath,
     JSON.stringify({
       server: { port: 4100 },
+      allowed_workspaces: ["~/projects", "/Users/tester/projects", "~/other"],
       supabase: {
         url: "https://example.supabase.co/",
         publishable_key: "sb_publishable_secret_value",
       },
       worker: {
         allowed_agents: ["codex", "claude"],
-        allowed_cwd_roots: ["~/projects"],
       },
     }),
     "utf8",
@@ -78,16 +83,19 @@ test("loadSettings merges partial JSON, expands ~ paths, and validates fields", 
   assert.equal(settings.server.host, "127.0.0.1");
   assert.equal(settings.server.port, 4100);
   assert.equal(settings.supabase.url, "https://example.supabase.co");
+  assert.deepEqual(settings.allowed_workspaces, [
+    "/Users/tester/projects",
+    "/Users/tester/other",
+  ]);
   assert.deepEqual(settings.worker.allowed_agents, ["codex", "claude"]);
-  assert.deepEqual(settings.worker.allowed_cwd_roots, ["/Users/tester/projects"]);
-  assert.equal(settings.worker.default_cwd, "/work/repo");
   assert.equal(expandHomePath("~", { home: "/Users/tester" }), "/Users/tester");
 });
 
-test("validateSettings rejects invalid config without leaking publishable_key", () => {
+test("validateSettings rejects invalid config, empty allowed_workspaces, legacy keys, and never leaks publishable_key", () => {
   assert.throws(
     () =>
       validateSettings({
+        allowed_workspaces: ["~"],
         supabase: {
           url: "ftp://bad.example.com",
           publishable_key: "secret-key-do-not-leak",
@@ -104,6 +112,54 @@ test("validateSettings rejects invalid config without leaking publishable_key", 
     () =>
       validateSettings(
         {
+          allowed_workspaces: [],
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /allowed_workspaces/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          allowed_workspaces: ["~"],
+          worker: { allowed_cwd_roots: ["~"] },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /allowed_cwd_roots/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          allowed_workspaces: ["~"],
+          worker: { default_cwd: "~" },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /default_cwd/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          allowed_workspaces: ["~"],
+          telegram: { workspaces: { repo: "~/repo" } },
+        },
+        { requireSupabase: false },
+      ),
+    (err) => err instanceof ConfigError && /telegram\.workspaces/.test(err.message),
+  );
+
+  assert.throws(
+    () =>
+      validateSettings(
+        {
+          allowed_workspaces: ["~"],
           worker: {
             default_permission_mode: "full",
             max_permission_mode: "workspace",
@@ -118,6 +174,7 @@ test("validateSettings rejects invalid config without leaking publishable_key", 
     () =>
       validateSettings(
         {
+          allowed_workspaces: ["~"],
           worker: {
             allowed_agents: [],
           },
@@ -131,6 +188,7 @@ test("validateSettings rejects invalid config without leaking publishable_key", 
     () =>
       validateSettings(
         {
+          allowed_workspaces: ["~"],
           worker: {
             lease_seconds: 15,
             heartbeat_interval_ms: 15000,
@@ -154,11 +212,12 @@ test("loadSettings throws ConfigError on invalid JSON", (t) => {
   );
 });
 
-test("validateSettings validates telegram config, expands workspaces, and never leaks bot_token", () => {
+test("validateSettings validates telegram config and never leaks bot_token", () => {
   assert.throws(
     () =>
       validateSettings(
         {
+          allowed_workspaces: ["~"],
           transports: { telegram: true },
           telegram: {
             bot_token: "",
@@ -175,6 +234,7 @@ test("validateSettings validates telegram config, expands workspaces, and never 
     () =>
       validateSettings(
         {
+          allowed_workspaces: ["~"],
           transports: { telegram: true },
           telegram: {
             bot_token: "secret-telegram-token-xyz",
@@ -192,22 +252,9 @@ test("validateSettings validates telegram config, expands workspaces, and never 
     },
   );
 
-  assert.throws(
-    () =>
-      validateSettings(
-        {
-          telegram: {
-            default_workspace: "missing-alias",
-            workspaces: { repo: "~/code/repo" },
-          },
-        },
-        { requireSupabase: false, home: "/Users/tester" },
-      ),
-    (err) => err instanceof ConfigError && /default_workspace/.test(err.message),
-  );
-
   const normalized = validateSettings(
     {
+      allowed_workspaces: ["~/projects"],
       transports: { telegram: true },
       telegram: {
         bot_token: "secret-telegram-token-xyz",
@@ -215,19 +262,16 @@ test("validateSettings validates telegram config, expands workspaces, and never 
         chat_id: "12345",
         default_agent: "claude",
         default_priority: "P0",
-        default_workspace: "main",
-        workspaces: { main: "~/projects/main" },
         api_base_url: "https://api.telegram.org/",
       },
     },
     { requireSupabase: false, home: "/Users/tester" },
   );
 
+  assert.deepEqual(normalized.allowed_workspaces, ["/Users/tester/projects"]);
   assert.equal(normalized.telegram.user_id, "12345");
   assert.equal(normalized.telegram.chat_id, "12345");
   assert.equal(normalized.telegram.default_agent, "claude");
   assert.equal(normalized.telegram.default_priority, "P0");
-  assert.equal(normalized.telegram.default_workspace, "main");
-  assert.equal(normalized.telegram.workspaces.main, "/Users/tester/projects/main");
   assert.equal(normalized.telegram.api_base_url, "https://api.telegram.org");
 });

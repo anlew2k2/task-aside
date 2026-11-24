@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { createTraceContext } from "#src/utilities/otel.js";
+import { expandHomePath } from "#src/utilities/settings.js";
 import { generateUuidV7 } from "#src/utilities/uuid.js";
 import {
   isPlainObject,
@@ -36,7 +37,7 @@ function emptyUsage() {
 /**
  * Render a structured Markdown prompt from a v1 task input envelope.
  */
-export function buildTaskPrompt(taskEnvelope, { permissionMode } = {}) {
+export function buildTaskPrompt(taskEnvelope, { permissionMode, allowedWorkspaces } = {}) {
   const data = taskEnvelope?.data ?? {};
   const metadata = taskEnvelope?.metadata ?? {};
 
@@ -56,6 +57,12 @@ export function buildTaskPrompt(taskEnvelope, { permissionMode } = {}) {
   lines.push(
     "- Task Breakdown / HITL: If the task is too large, you may create child subtasks referencing `parent_id` set to this Task ID. If human clarification is needed, complete your response clearly with the open questions.",
   );
+
+  if (Array.isArray(allowedWorkspaces) && allowedWorkspaces.length > 0) {
+    lines.push(
+      `- Workspace Boundary: Only read, modify, or execute commands inside the allowed workspace roots (and their subdirectories): ${allowedWorkspaces.join(", ")}.`,
+    );
+  }
 
   if (permissionMode === "read-only") {
     lines.push(
@@ -504,6 +511,7 @@ function summarizeStderr(stderr) {
  */
 export function createAgentService({
   workerConfig,
+  allowedWorkspaces = [],
   spawnImpl = spawn,
   now = () => Date.now(),
   generateId = generateUuidV7,
@@ -596,7 +604,15 @@ export function createAgentService({
     const permissionMode = execReq.permission_mode ?? workerConfig.default_permission_mode;
     const timeoutMs = execReq.timeout_ms ?? workerConfig.default_timeout_ms;
     const requestedSessionId = execReq.session_id ?? null;
-    const requestedCwd = execReq.cwd ?? workerConfig.default_cwd;
+    const defaultCwd = Array.isArray(allowedWorkspaces) ? (allowedWorkspaces[0] ?? null) : null;
+    const rawRequestedCwd = execReq.cwd;
+    const requestedCwd =
+      typeof rawRequestedCwd === "string" &&
+      (rawRequestedCwd === "~" ||
+        rawRequestedCwd.startsWith("~/") ||
+        rawRequestedCwd.startsWith("~\\"))
+        ? expandHomePath(rawRequestedCwd)
+        : (rawRequestedCwd ?? defaultCwd);
 
     const runDirName = attempt > 1 ? `${taskId}-attempt-${attempt}` : taskId;
     const runDir = join(workerConfig.runs_dir, runDirName);
@@ -660,6 +676,14 @@ export function createAgentService({
       );
     }
 
+    if (!Array.isArray(allowedWorkspaces) || allowedWorkspaces.length === 0) {
+      return failPreSpawn(
+        "CWD_NOT_ALLOWED",
+        "permission",
+        "No allowed_workspaces configured",
+      );
+    }
+
     if (!requestedCwd || !existsSync(requestedCwd)) {
       return failPreSpawn(
         "INVALID_CWD",
@@ -687,28 +711,26 @@ export function createAgentService({
       );
     }
 
-    if (Array.isArray(workerConfig.allowed_cwd_roots) && workerConfig.allowed_cwd_roots.length > 0) {
-      const allowed = workerConfig.allowed_cwd_roots.some((root) => {
-        if (!existsSync(root)) {
-          return false;
-        }
-        try {
-          return isPathWithinRoot(resolvedCwd, realpathSync(root));
-        } catch {
-          return false;
-        }
-      });
-
-      if (!allowed) {
-        return failPreSpawn(
-          "CWD_NOT_ALLOWED",
-          "permission",
-          `Working directory "${resolvedCwd}" is outside worker.allowed_cwd_roots`,
-        );
+    const allowed = allowedWorkspaces.some((root) => {
+      if (!existsSync(root)) {
+        return false;
       }
+      try {
+        return isPathWithinRoot(resolvedCwd, realpathSync(root));
+      } catch {
+        return false;
+      }
+    });
+
+    if (!allowed) {
+      return failPreSpawn(
+        "CWD_NOT_ALLOWED",
+        "permission",
+        `Working directory "${resolvedCwd}" is outside allowed_workspaces`,
+      );
     }
 
-    const promptText = buildTaskPrompt(taskEnvelope, { permissionMode });
+    const promptText = buildTaskPrompt(taskEnvelope, { permissionMode, allowedWorkspaces });
     writeFileSync(promptPath, `${promptText}\n`, "utf8");
 
     const command = buildAgentCommand({

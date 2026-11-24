@@ -10,6 +10,7 @@ Key groups in `~/.task-aside/settings.json`:
 
 - `server`: `{ "host": "127.0.0.1", "port": 3100 }`
 - `transports`: `{ "http": true, "mcp": true, "worker": true, "telegram": false }`
+- `allowed_workspaces`: Required non-empty array of allowed workspace root paths (all subdirectories are permitted; the first entry is used as the default working directory when a task omits `execution.cwd`, and interactive CLI startup prompts you to enter at least one path—such as `~`—if empty)
 - `supabase`: `{ "url": "https://<project>.supabase.co", "publishable_key": "<key>", "schema": "public", "table": "tasks" }`
 - `telegram`:
   - `bot_token`: Telegram Bot API token (required when `transports.telegram` is `true`)
@@ -17,8 +18,6 @@ Key groups in `~/.task-aside/settings.json`:
   - `chat_id`: Paired Telegram private chat ID (set automatically by `task-aside auth telegram`)
   - `default_agent`: Default agent for Telegram intake (`null` falls back to first allowed worker agent)
   - `default_priority`: Default task priority (`"P0"`–`"P3"`, default: `"P1"`)
-  - `workspaces`: Named workspace alias map (`{ "repo": "~/path/to/repo" }`)
-  - `default_workspace`: Default workspace alias or `null`
   - `poll_timeout_seconds`: Long-polling timeout in seconds (`1`–`50`, default: `25`)
   - `api_base_url`: Bot API base URL (default: `"https://api.telegram.org"`)
 - `logging`: `{ "dir": "~/.task-aside/logs" }`
@@ -31,8 +30,6 @@ Key groups in `~/.task-aside/settings.json`:
   - `allowed_agents`: Worker agent allowlist (default: `["agy", "claude", "codex"]`)
   - `default_permission_mode`: Default permission policy (`"read-only" | "workspace" | "full"`, default: `"workspace"`)
   - `max_permission_mode`: Maximum permission policy ceiling allowed by this worker (default: `"workspace"`)
-  - `default_cwd`: Default working directory (`""` falls back to `process.cwd()`)
-  - `allowed_cwd_roots`: Optional array of allowed root directories (`[]` allows any existing directory)
   - `default_timeout_ms`: Default execution timeout in ms (default: `600000`)
   - `agents`: Per-agent CLI overrides (`agy`, `claude`, `codex` executables, `default_model`/`default_effort` defaulting to `null` to defer to each CLI harness's own defaults, and `codex.skip_git_repo_check`)
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { authTelegram, startApp } from "#src/index.js";
 import { getPackageInfo } from "#src/utilities/package-info.js";
@@ -81,10 +82,46 @@ function parseCliArgs(argv) {
   };
 }
 
+async function promptAllowedWorkspacesInteractive({ settingsPath }) {
+  console.log(`\nNo allowed workspaces configured in ${settingsPath}.`);
+  console.log(
+    'Enter at least one workspace folder (tip: enter "~" for simplicity, or comma-separated paths).',
+  );
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    while (true) {
+      let answer;
+      try {
+        answer = await rl.question("Allowed workspace folder(s) [tip: ~]: ");
+      } catch (error) {
+        if (error?.name === "AbortError" || error?.code === "ERR_USE_AFTER_CLOSE") {
+          return [];
+        }
+        throw error;
+      }
+      const entries = answer
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (entries.length > 0) {
+        return entries;
+      }
+      console.log("Please enter at least one folder path (e.g. ~ or ~/workspace).");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
 const { positionals, ...config } = parseCliArgs(process.argv.slice(2));
 
 if (positionals.length === 0) {
-  startApp(config).catch((error) => {
+  const promptAllowedWorkspaces =
+    process.stdin.isTTY && process.stdout.isTTY ? promptAllowedWorkspacesInteractive : undefined;
+  startApp({ ...config, promptAllowedWorkspaces }).catch((error) => {
     console.error(`Failed to start ${name}: ${error.message}`);
     process.exit(1);
   });
