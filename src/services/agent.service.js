@@ -1,14 +1,14 @@
 import { spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
-import { createTraceContext } from "../utilities/otel.js";
-import { generateUuidV7 } from "../utilities/uuid.js";
+import { createTraceContext } from "#src/utilities/otel.js";
+import { generateUuidV7 } from "#src/utilities/uuid.js";
 import {
   isPlainObject,
   PERMISSION_MODE_RANK,
   TASK_RESULT_SCHEMA_TYPE,
   TASK_SCHEMA_VERSION,
-} from "../utilities/validation.js";
+} from "#src/utilities/validation.js";
 
 const KILL_GRACE_MS = 5_000;
 

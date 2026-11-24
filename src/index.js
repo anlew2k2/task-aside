@@ -1,15 +1,15 @@
-import { createHealthHandler } from "./handlers/health.handler.js";
-import { createTaskHandler } from "./handlers/task.handler.js";
-import { createSupabaseTaskRepository } from "./repositories/task.repository.js";
-import { createAgentService } from "./services/agent.service.js";
-import { createHttpTransport } from "./transports/http.js";
-import { createMcpTransport } from "./transports/mcp.js";
-import { createWorkerTransport } from "./transports/worker.js";
-import { createTaskUsecase } from "./usecases/task.usecase.js";
-import { ConfigError } from "./utilities/errors.js";
-import { createFileLogger } from "./utilities/logger.js";
-import { getPackageInfo } from "./utilities/package-info.js";
-import { loadSettings, validateSettings } from "./utilities/settings.js";
+import { createHealthHandler } from "#src/handlers/health.handler.js";
+import { createTaskHandler } from "#src/handlers/task.handler.js";
+import { createSupabaseTaskRepository } from "#src/repositories/task.repository.js";
+import { createAgentService } from "#src/services/agent.service.js";
+import { createHttpTransport } from "#src/transports/http.js";
+import { createMcpTransport } from "#src/transports/mcp.js";
+import { createWorkerTransport } from "#src/transports/worker.js";
+import { createTaskUsecase } from "#src/usecases/task.usecase.js";
+import { ConfigError } from "#src/utilities/errors.js";
+import { createFileLogger } from "#src/utilities/logger.js";
+import { getPackageInfo } from "#src/utilities/package-info.js";
+import { loadSettings, validateSettings } from "#src/utilities/settings.js";
 
 /**
  * Composition root: wires settings -> repositories -> services -> usecases -> handlers -> transports.

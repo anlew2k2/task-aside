@@ -9,7 +9,7 @@ import {
   assertTaskExecution,
   assertTaskPriority,
   assertUuidV7,
-} from "../utilities/validation.js";
+} from "#src/utilities/validation.js";
 
 /**
  * Transport-agnostic task handler shared by HTTP, MCP, and Worker transports.

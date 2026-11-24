@@ -3,13 +3,13 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ConfigError } from "../src/utilities/errors.js";
+import { ConfigError } from "#src/utilities/errors.js";
 import {
   createDefaultSettings,
   expandHomePath,
   loadSettings,
   validateSettings,
-} from "../src/utilities/settings.js";
+} from "#src/utilities/settings.js";
 
 test("loadSettings creates default settings.json with 0600 mode when missing", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "task-aside-settings-"));

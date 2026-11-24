@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { parseArgs } from "node:util";
-import { startApp } from "../src/index.js";
-import { getPackageInfo } from "../src/utilities/package-info.js";
-import { DEFAULT_SETTINGS_PATH } from "../src/utilities/settings.js";
+import { startApp } from "#src/index.js";
+import { getPackageInfo } from "#src/utilities/package-info.js";
+import { DEFAULT_SETTINGS_PATH } from "#src/utilities/settings.js";
 
 const { name, version } = getPackageInfo();
 

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
-import { NotFoundError, StorageError, ValidationError } from "../utilities/errors.js";
-import { readJsonBody, sendEmpty, sendJson } from "../utilities/http.js";
+import { NotFoundError, StorageError, ValidationError } from "#src/utilities/errors.js";
+import { readJsonBody, sendEmpty, sendJson } from "#src/utilities/http.js";
 
 /**
  * HTTP server transport routing `/health`, `/tasks`, `/tasks/:id`, and `/mcp`.

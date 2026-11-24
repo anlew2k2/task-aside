@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ValidationError } from "../src/utilities/errors.js";
-import { generateUuidV7, isUuidV7 } from "../src/utilities/uuid.js";
+import { ValidationError } from "#src/utilities/errors.js";
+import { generateUuidV7, isUuidV7 } from "#src/utilities/uuid.js";
 import {
   assertAgentName,
   assertNonEmptyString,
@@ -19,7 +19,7 @@ import {
   SUPPORTED_AGENTS,
   TASK_PRIORITIES,
   TASK_STATUSES,
-} from "../src/utilities/validation.js";
+} from "#src/utilities/validation.js";
 
 test("generateUuidV7 creates valid RFC 9562 v7 UUIDs with embedded timestamp", () => {
   const fixedMs = Date.now() + 5_000;

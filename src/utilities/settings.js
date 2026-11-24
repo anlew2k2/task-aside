@@ -1,13 +1,13 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { ConfigError } from "./errors.js";
+import { ConfigError } from "#src/utilities/errors.js";
 import {
   isPlainObject,
   PERMISSION_MODE_RANK,
   PERMISSION_MODES,
   SUPPORTED_AGENTS,
-} from "./validation.js";
+} from "#src/utilities/validation.js";
 
 export const DEFAULT_HOME_DIR = join(homedir(), ".task-aside");
 export const DEFAULT_SETTINGS_PATH = join(DEFAULT_HOME_DIR, "settings.json");

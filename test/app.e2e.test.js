@@ -3,10 +3,10 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { startApp } from "../src/index.js";
-import { createInMemoryTaskRepository } from "../src/repositories/task.repository.js";
-import { ConfigError } from "../src/utilities/errors.js";
-import { generateUuidV7, isUuidV7 } from "../src/utilities/uuid.js";
+import { startApp } from "#src/index.js";
+import { createInMemoryTaskRepository } from "#src/repositories/task.repository.js";
+import { ConfigError } from "#src/utilities/errors.js";
+import { generateUuidV7, isUuidV7 } from "#src/utilities/uuid.js";
 
 function createMemoryLogger() {
   const logs = [];

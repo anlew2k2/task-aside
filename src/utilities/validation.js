@@ -1,5 +1,5 @@
-import { ValidationError } from "./errors.js";
-import { isUuidV7 } from "./uuid.js";
+import { ValidationError } from "#src/utilities/errors.js";
+import { isUuidV7 } from "#src/utilities/uuid.js";
 
 export const TASK_SCHEMA_VERSION = "v1";
 export const TASK_RESULT_SCHEMA_TYPE = "task_result";

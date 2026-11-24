@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createSupabaseTaskRepository } from "../src/repositories/task.repository.js";
-import { createTraceContext } from "../src/utilities/otel.js";
-import { loadSettings } from "../src/utilities/settings.js";
-import { generateUuidV7 } from "../src/utilities/uuid.js";
+import { createSupabaseTaskRepository } from "#src/repositories/task.repository.js";
+import { createTraceContext } from "#src/utilities/otel.js";
+import { loadSettings } from "#src/utilities/settings.js";
+import { generateUuidV7 } from "#src/utilities/uuid.js";
 
 const skipLiveReason =
   process.env.RUN_LIVE_TESTS === "1"

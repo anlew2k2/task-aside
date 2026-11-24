@@ -6,8 +6,8 @@ import test from "node:test";
 import {
   buildAgentCommand,
   createAgentService,
-} from "../src/services/agent.service.js";
-import { generateUuidV7 } from "../src/utilities/uuid.js";
+} from "#src/services/agent.service.js";
+import { generateUuidV7 } from "#src/utilities/uuid.js";
 
 function makeFakeCli(dir, filename, scriptBody) {
   const filePath = join(dir, filename);

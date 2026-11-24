@@ -45,6 +45,7 @@ src/index.js  =   Composition root (wires dependencies via DI; no business logic
 3. **Keep `services/` and `repositories/` Async**: All service and repository methods must return Promises (`async`).
 4. **Runtime Compatibility**: Use standard `node:*` built-in modules supported by both Node.js and Bun. Do not use JSON import attributes (`with { type: "json" }`); read `package.json` via `src/utilities/package-info.js`.
 5. **Global Configuration**: Store configuration, logs, and run artifacts under `~/.task-aside/` (`~/.task-aside/settings.json`) rather than `.env` files.
+6. **Subpath Imports**: Use the `#src/*` subpath import alias (`"./src/*"` in `package.json`) with explicit `.js` extensions for internal imports across `bin/`, `src/`, and `test/`.
 
 ## Live Docs Maintenance
 
