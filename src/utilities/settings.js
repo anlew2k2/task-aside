@@ -60,18 +60,18 @@ export function createDefaultSettings() {
       agents: {
         agy: {
           executable: "agy",
-          default_model: "gemini-pro-orchestrator-neon",
-          default_effort: "high",
+          default_model: null,
+          default_effort: null,
         },
         claude: {
           executable: "claude",
-          default_model: "sonnet",
-          default_effort: "high",
+          default_model: null,
+          default_effort: null,
         },
         codex: {
           executable: "codex",
-          default_model: "sol",
-          default_effort: "high",
+          default_model: null,
+          default_effort: null,
           skip_git_repo_check: false,
         },
       },

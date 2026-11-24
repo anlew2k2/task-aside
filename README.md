@@ -34,7 +34,7 @@ Key groups in `~/.task-aside/settings.json`:
   - `default_cwd`: Default working directory (`""` falls back to `process.cwd()`)
   - `allowed_cwd_roots`: Optional array of allowed root directories (`[]` allows any existing directory)
   - `default_timeout_ms`: Default execution timeout in ms (default: `600000`)
-  - `agents`: Per-agent CLI overrides (`agy`, `claude`, `codex` executables, default model/effort, `codex.skip_git_repo_check`)
+  - `agents`: Per-agent CLI overrides (`agy`, `claude`, `codex` executables, `default_model`/`default_effort` defaulting to `null` to defer to each CLI harness's own defaults, and `codex.skip_git_repo_check`)
 
 ## Supabase Schema
 

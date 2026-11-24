@@ -33,12 +33,12 @@ test("loadSettings creates default settings.json with 0600 mode when missing", (
   assert.equal(settings.transports.telegram, false);
   assert.equal(settings.telegram.default_agent, "agy");
   assert.equal(settings.telegram.default_priority, "P1");
-  assert.equal(settings.worker.agents.agy.default_model, "gemini-pro-orchestrator-neon");
-  assert.equal(settings.worker.agents.agy.default_effort, "high");
-  assert.equal(settings.worker.agents.claude.default_model, "sonnet");
-  assert.equal(settings.worker.agents.claude.default_effort, "high");
-  assert.equal(settings.worker.agents.codex.default_model, "sol");
-  assert.equal(settings.worker.agents.codex.default_effort, "high");
+  assert.equal(settings.worker.agents.agy.default_model, null);
+  assert.equal(settings.worker.agents.agy.default_effort, null);
+  assert.equal(settings.worker.agents.claude.default_model, null);
+  assert.equal(settings.worker.agents.claude.default_effort, null);
+  assert.equal(settings.worker.agents.codex.default_model, null);
+  assert.equal(settings.worker.agents.codex.default_effort, null);
 
   const mode = statSync(configPath).mode & 0o777;
   assert.equal(mode, 0o600);
