@@ -1,0 +1,31 @@
+{
+  "name": "task-aside",
+  "version": "0.1.0",
+  "description": "Minimal MCP port and background worker runnable via npx or bunx with zero dependencies.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "task-aside": "./bin/task-aside.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "node ./bin/task-aside.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anlew2k2/task-aside.git"
+  },
+  "keywords": [
+    "mcp",
+    "worker",
+    "task-aside",
+    "cli"
+  ]
+}
